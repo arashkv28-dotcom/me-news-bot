@@ -1,0 +1,59 @@
+{
+  "region_filter": true,
+  "_comment": "region_filter=true یعنی از فیدهای عمومی فقط خبرهای مرتبط با خاورمیانه منتشر شود (کلیدواژه‌ها در bot.py). فیدهایی که \"region\": true دارند معاف‌اند چون خودشان منطقه‌ای هستند.",
+  "feeds": [
+    {
+      "name": "بی‌بی‌سی فارسی",
+      "url": "https://feeds.bbci.co.uk/persian/rss.xml",
+      "lang": "fa",
+      "enabled": true
+    },
+    {
+      "name": "رادیو فردا",
+      "url": "https://www.radiofarda.com/api/",
+      "lang": "fa",
+      "enabled": true
+    },
+    {
+      "name": "یورونیوز فارسی",
+      "url": "https://fa.euronews.com/rss?level=theme&name=news",
+      "lang": "fa",
+      "enabled": true
+    },
+    {
+      "name": "صدای آمریکا",
+      "url": "https://www.voanews.com/api/",
+      "lang": "fa",
+      "enabled": true,
+      "require_persian": true
+    },
+    {
+      "name": "الجزیره (عربی)",
+      "url": "https://www.aljazeera.net/aljazeerarss/a7c186be-1baa-4bd4-9d80-a84db769f779/73d0e1b4-532f-45ef-b135-bfdff8b8cab9",
+      "lang": "ar",
+      "enabled": false,
+      "region": true
+    },
+    {
+      "name": "BBC Middle East",
+      "url": "http://feeds.bbci.co.uk/news/world/middle_east/rss.xml",
+      "lang": "en",
+      "enabled": false,
+      "region": true
+    },
+    {
+      "name": "ایران اینترنشنال",
+      "url": "https://www.iranintl.com/fa/rss.xml",
+      "lang": "fa",
+      "enabled": false,
+      "note": "الان از بیرون ایران فید RSS نمی‌دهد و صفحهٔ HTML برمی‌گرداند. اگر روزی درست شد، enabled را true کن."
+    },
+    {
+      "name": "ایرنا (خبرگزاری رسمی ایران)",
+      "url": "https://fa.irna.ir/rss/tp/1",
+      "lang": "fa",
+      "enabled": false,
+      "note": "از محیط گیت‌هاب در دسترس نیست (مسدود). اگر در جای دیگری کار کرد، enabled را true کن."
+    }
+  ]
+}
