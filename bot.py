@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ربات خبری خاورمیانه -> کانال تلگرام
+ربات خبری خاورمیانه -> کانال/گروه تلگرام + پنل کنترل در پی‌وی
 
-فیدهای RSS فارسی را می‌خواند، خبرهای تکراری را حذف می‌کند و هر خبر را
-به‌صورت یک پست جداگانه در کانال تلگرام منتشر می‌کند.
+دو حالت اجرا:
+  1) python bot.py            اجرای یک‌باره (مخصوص GitHub Actions، هر ساعت)
+  2) python bot.py serve      حالت زنده: پنل دکمه‌شیشه‌ای در پی‌وی، چند مقصد،
+                              ارسال خودکار هر N دقیقه (مخصوص Termux/سرور)
+  3) python bot.py web        حالت وب‌هوک برای میزبان ابری رایگان (Render و مشابه آن)؛
+                              همان پنل دکمه‌شیشه‌ای، بدون نیاز به روشن‌بودن گوشی
 
-بدون سرور: روی GitHub Actions هر ساعت یک‌بار اجرا می‌شود (کاملاً رایگان).
+متغیرهای حالت web (اختیاری ولی توصیه‌شده):
+  GITHUB_TOKEN  توکن fine-grained گیت‌هاب (دسترسی Contents روی همین مخزن)
+  GITHUB_REPO   مثل username/me-news-bot  <- حافظه در مخزن ذخیره می‌شود
+  WEBHOOK_URL   اختیاری؛ روی Render خودکار از RENDER_EXTERNAL_URL ساخته می‌شود
 
-استفادهٔ محلی:
-    export BOT_TOKEN="123:ABC..."
-    export CHAT_ID="-1001234567890"
-    python bot.py            # ارسال واقعی
-    python bot.py --dry-run  # فقط نمایش، بدون ارسال
+متغیرهای محیطی:
+  BOT_TOKEN   توکن BotFather (الزامی)
+  CHAT_ID     اختیاری: مقصد پیش‌فرض اگر هنوز مقصدی اضافه نکرده‌اید
+  OWNER_ID    اختیاری: شناسهٔ عددی مدیر؛ اگر خالی باشد، اولین /start مالک می‌شود
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import html
 import json
 import os
+import threading
 import re
 import sys
 import time
@@ -28,13 +37,19 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import feedparser
 import jdatetime
 import requests
 
 BASE = Path(__file__).resolve().parent
 FEEDS_FILE = BASE / "feeds.json"
-STATE_FILE = Path(os.environ.get("STATE_FILE", BASE / ".state" / "seen.json"))
+STATE_DIR = Path(os.environ.get("STATE_DIR", BASE / ".state"))
+SEEN_FILE = STATE_DIR / "seen.json"
+DESTS_FILE = STATE_DIR / "channels.json"
+SETTINGS_FILE = STATE_DIR / "settings.json"
+OFFSET_FILE = STATE_DIR / "offset.json"
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 USER_AGENT = (
@@ -46,49 +61,45 @@ USER_AGENT = (
 
 TZ_TEHRAN = timezone(timedelta(hours=3, minutes=30))
 
-MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "6"))          # حداکثر پست در هر اجرا
-MAX_AGE_HOURS = int(os.environ.get("MAX_AGE_HOURS", "24"))      # قدیمی‌تر از این ارسال نشود
-SUMMARY_CHARS = int(os.environ.get("SUMMARY_CHARS", "420"))     # طول خلاصه
-DELAY_SECONDS = float(os.environ.get("DELAY_SECONDS", "4"))     # فاصله بین پست‌ها (ضدفلود)
-SEEN_LIMIT = int(os.environ.get("SEEN_LIMIT", "4000"))          # سقف حافظهٔ «دیده شده‌ها»
-FIRST_RUN_MAX = int(os.environ.get("FIRST_RUN_MAX", "3"))       # در اولین اجرا فقط چند خبر
-SKIP_NO_DATE = os.environ.get("SKIP_NO_DATE", "1") == "1"       # خبر بدون تاریخ رد شود؟
+MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "6"))
+MAX_AGE_HOURS = int(os.environ.get("MAX_AGE_HOURS", "24"))
+SUMMARY_CHARS = int(os.environ.get("SUMMARY_CHARS", "420"))
+DELAY_SECONDS = float(os.environ.get("DELAY_SECONDS", "3"))
+SEEN_LIMIT = int(os.environ.get("SEEN_LIMIT", "4000"))
+SKIP_NO_DATE = os.environ.get("SKIP_NO_DATE", "1") == "1"
+FIRST_RUN_MAX = int(os.environ.get("FIRST_RUN_MAX", "3"))
+
+INTERVAL_CHOICES = [15, 30, 60, 120, 180, 360]   # دقیقه
 
 PERSIAN_RE = re.compile(r"[\u0600-\u06FF]")
 
-# کلیدواژه‌های منطقهٔ خاورمیانه — اگر فید عمومی (مثل یورونیوز فارسی) خبری از
-# کره جنوبی یا فرانسه داد، با این فهرست رد می‌شود.
-# فیدهایی که در feeds.json برچسب "region": true دارند از این فیلتر معاف‌اند.
+# کلیدواژه‌های منطقهٔ خاورمیانه (فیدهای با برچسب region معاف‌اند)
 REGION_KEYWORDS = [
-    # کشورها و مناطق
     "ایران", "ایرانی", "تهران", "خامن", "پزشکیان", "پاسداران", "بسیج", "مجلس شورای",
     "عراق", "بغداد", "اربیل", "کردستان عراق", "نجف", "بصره", "حشد",
     "سوریه", "دمشق", "حلب", "لاذقیه", "درعا", "ادلب",
     "لبنان", "بیروت", "حزب الله", "حزب‌الله", "ضاحیه", "نبیه بری",
     "فلسطین", "غزه", "کرانه باختری", "قدس", "بیت المقدس", "حماس", "فتح",
-    "اسرائیل", "تل آویو", "نتانیاهو", " IDF", "ارتش اسرائیل",
+    "اسرائیل", "تل آویو", "نتانیاهو", "ارتش اسرائیل",
     "یمن", "صنعا", "انصارالله", "حوثی", "حدیده", "باب المندب",
     "اردن", "عمان", "بحرین", "منامه", "کویت", "قطر", "دوحه",
     "عربستان", "ریاض", "جده", "نفت", "آرامکو", "محمد بن سلمان",
-    "امارات", "دبی", "ابوظبی", "ابوظبی",
+    "امارات", "دبی", "ابوظبی",
     "افغانستان", "کابل", "طالبان", "قندهار", "هرات",
     "ترکیه", "آنکارا", "استانبول", "اردوغان", "پ ک ک", "کردهای سوریه",
-    "مصر", "قاهره", "سینا", "کانال سوئز", "غزه",
+    "مصر", "قاهره", "سینا", "کانال سوئز",
     "لیبی", "طرابلس", "سودان", "خارطوم", "تونس", "الجزایر", "مراکش",
     "آذربایجان", "باکو", "ارمنستان", "ایروان", "قره باغ", "قره‌باغ",
     "پاکستان", "اسلام آباد", "هند", "کشمیر",
-    # نهادها و مفاهیم منطقه‌ای
     "آژانس بین المللی انرژی اتمی", "آژانس بین‌المللی انرژی اتمی", "آژانس",
     "برجام", "تحریم", "سانتریفیوژ", "غنی سازی", "غنی‌سازی", "اورانیوم", "نطنز", "فردو",
     "سپاه پاسداران", "سپاه", "نیروی قدس", "محور مقاومت", "نیابتی",
     "تنگه هرمز", "خلیج فارس", "دریای سرخ", "خاورمیانه", "خاور نزدیک",
-    "اسلامی", "مسلمان", "شیعه", "سنی", "اسماعیلیه",
+    "اسلامی", "مسلمان", "شیعه", "سنی",
     "امریکا", "آمریکا", "ترامپ", "کاخ سفید", "پنتاگون", "ناو",
     "روسیه", "مسکو", "پوتین", "اوکراین", "کی یف", "کی‌یف",
-    "چین", "پکن", "پوتین",
+    "چین", "پکن",
 ]
-
-# الگوی کوتاه‌تر و سریع: اگر هیچ‌کدام نبود، خبر رد می‌شود
 REGION_RE = re.compile("|".join(re.escape(k.strip()) for k in REGION_KEYWORDS if k.strip()))
 
 
@@ -111,8 +122,96 @@ def save_json(path: Path, data) -> None:
     tmp.replace(path)
 
 
+# ------------------------------------------- همگام‌سازی حافظه با گیت‌هاب ---
+
+SYNC_FILES = ("seen.json", "channels.json", "settings.json")
+
+
+class GitState:
+    # حافظهٔ ربات را در مخزن گیت‌هاب نگه می‌دارد تا میزبان‌های بدون دیسک
+    # (مثل Render رایگان) با هر ری‌استارت حافظه را از دست ندهند و چند حالت
+    # اجرا (Actions + وب) بدون پست تکراری کنار هم کار کنند.
+
+    def __init__(self, token: str, repo: str, branch: str = "main"):
+        self.token = token
+        self.repo = repo
+        self.branch = branch
+        self.base = os.environ.get("GITHUB_API", "https://api.github.com")
+        self._hashes = {}
+        self._lock = threading.Lock()
+
+    def _req(self, method, path, payload=None):
+        try:
+            r = requests.request(method, self.base + path, json=payload, timeout=30,
+                                 headers={"Authorization": "Bearer " + self.token,
+                                          "Accept": "application/vnd.github+json"})
+            try:
+                return r.status_code, r.json()
+            except ValueError:
+                return r.status_code, {}
+        except requests.RequestException as exc:
+            print(f"[warn] GitHub: {exc}")
+            return 0, {}
+
+    def pull(self):
+        for name in SYNC_FILES:
+            code, data = self._req("GET", f"/repos/{self.repo}/contents/.state/{name}?ref={self.branch}")
+            if code == 200 and data.get("content"):
+                try:
+                    content = base64.b64decode(data["content"]).decode("utf-8")
+                    (STATE_DIR / name).parent.mkdir(parents=True, exist_ok=True)
+                    (STATE_DIR / name).write_text(content, encoding="utf-8")
+                    self._hashes[name] = hashlib.sha256(content.encode()).hexdigest()
+                    print(f"[info] حافظه از گیت‌هاب خواند شد: {name}")
+                except Exception as exc:
+                    print(f"[warn] pull {name}: {exc}")
+
+    def push_file(self, path):
+        name = path.name
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        h = hashlib.sha256(content.encode()).hexdigest()
+        if self._hashes.get(name) == h:
+            return True
+        b64 = base64.b64encode(content.encode()).decode()
+        for _attempt in range(2):
+            code, meta = self._req("GET", f"/repos/{self.repo}/contents/.state/{name}?ref={self.branch}")
+            sha = meta.get("sha") if code == 200 else None
+            payload = {"message": f"state: {name} [skip ci]", "content": b64, "branch": self.branch}
+            if sha:
+                payload["sha"] = sha
+            code, _ = self._req("PUT", f"/repos/{self.repo}/contents/.state/{name}", payload)
+            if code in (200, 201):
+                self._hashes[name] = h
+                return True
+        print(f"[warn] push {name} ناموفق")
+        return False
+
+    def sync(self):
+        with self._lock:
+            for name in SYNC_FILES:
+                self.push_file(STATE_DIR / name)
+
+
+STORE = None
+
+
+def init_store():
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repo = os.environ.get("GITHUB_REPO", "")
+    if token and repo:
+        return GitState(token, repo, os.environ.get("GITHUB_BRANCH", "main"))
+    return None
+
+
+def sync_state():
+    if STORE:
+        STORE.sync()
+
+
 def normalize(text: str) -> str:
-    """تمیزکردن متن خبر: حذف HTML، نیم‌فاصله‌ها و فاصله‌های اضافه."""
     if not text:
         return ""
     text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
@@ -127,13 +226,10 @@ def normalize(text: str) -> str:
 
 
 def to_digits(text: str) -> str:
-    """تبدیل ارقام لاتین به فارسی (فقط برای زمان/تاریخ)."""
-    table = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
-    return text.translate(table)
+    return text.translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
 
 def clean_link(raw: str) -> str:
-    """پارامترهای ردیابی را از لینک نمایشی پاک می‌کند."""
     if not raw:
         return ""
     raw = html.unescape(raw).strip()
@@ -143,7 +239,6 @@ def clean_link(raw: str) -> str:
 
 
 def entry_id(entry) -> str:
-    """شناسهٔ یکتا برای تشخیص خبر تکراری."""
     raw = entry.get("id") or entry.get("link") or entry.get("title") or ""
     raw = str(raw).strip()
     if not raw:
@@ -174,36 +269,98 @@ def is_persian(text: str) -> bool:
 
 
 def jalali_stamp(dt: datetime) -> str:
-    """۱۴۰۵/۰۶/۰۵ — ۱۷:۳۰ به وقت ایران"""
     local = dt.astimezone(TZ_TEHRAN)
     jd = jdatetime.datetime.fromgregorian(datetime=local)
     return f"{jd.year}/{jd.month:02d}/{jd.day:02d} — {jd.hour:02d}:{jd.minute:02d}"
 
 
+# ------------------------------------------------------------- کلاینت تلگرام ---
+
+class Tg:
+    """پوشش سبک روی Bot API با مدیریت خطا و ۴۲۹."""
+
+    def __init__(self, token: str):
+        self.token = token
+        self._me = None
+
+    def call(self, method: str, payload: dict | None = None, retries: int = 2) -> dict:
+        url = TELEGRAM_API.format(token=self.token, method=method)
+        for _ in range(retries + 1):
+            try:
+                resp = requests.post(url, json=payload or {}, timeout=40)
+                data = resp.json()
+            except (requests.RequestException, ValueError) as exc:
+                return {"ok": False, "description": str(exc)}
+            if not isinstance(data, dict):
+                return {"ok": False, "description": str(data)}
+            data["http_status"] = resp.status_code
+            if (data.get("error_code") or resp.status_code) == 429:
+                time.sleep(float(data.get("parameters", {}).get("retry_after", 3)) + 1)
+                continue
+            return data
+        return {"ok": False, "description": "retry limit"}
+
+    def me(self) -> dict:
+        if self._me is None:
+            r = self.call("getMe")
+            self._me = r.get("result", {}) if r.get("ok") else {}
+        return self._me
+
+    def send(self, chat_id, text: str, markup=None, parse="HTML") -> dict:
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": parse,
+                   "disable_web_page_preview": False}
+        if markup:
+            payload["reply_markup"] = {"inline_keyboard": markup}
+        return self.call("sendMessage", payload)
+
+    def edit(self, chat_id, message_id, text: str, markup=None) -> dict:
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": text,
+                   "parse_mode": "HTML"}
+        if markup:
+            payload["reply_markup"] = {"inline_keyboard": markup}
+        r = self.call("editMessageText", payload)
+        if not r.get("ok") and "message is not modified" in str(r.get("description")):
+            return {"ok": True}
+        return r
+
+    def answer(self, callback_query_id: str, text: str | None = None) -> None:
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+            payload["show_alert"] = False
+        self.call("answerCallbackQuery", payload)
+
+    def get_updates(self, offset: int | None, timeout: int = 25) -> list:
+        payload = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
+        if offset is not None:
+            payload["offset"] = offset
+        r = self.call("getUpdates", payload, retries=1)
+        return r.get("result", []) if r.get("ok") else []
+
+    def get_chat(self, chat_id) -> dict:
+        return self.call("getChat", {"chat_id": chat_id})
+
+    def chat_member(self, chat_id, user_id) -> dict:
+        return self.call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+
+
 # ---------------------------------------------------------------- فیدها ---
 
 def fetch_feed(feed: dict):
-    """یک فید را می‌گیرد و لیست خبرها را برمی‌گرداند."""
     name = feed["name"]
     try:
-        resp = requests.get(
-            feed["url"],
-            timeout=25,
-            headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
-        )
+        resp = requests.get(feed["url"], timeout=25,
+                            headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
     except requests.RequestException as exc:
         print(f"[warn] {name}: خطای شبکه — {exc}")
         return []
-
     if resp.status_code != 200:
         print(f"[warn] {name}: کد HTTP {resp.status_code}")
         return []
-
     parsed = feedparser.parse(resp.content)
     if not parsed.entries:
         print(f"[warn] {name}: خبری پیدا نشد (bozo={parsed.bozo})")
         return []
-
     return parsed.entries
 
 
@@ -230,13 +387,9 @@ def collect_items(cfg: dict) -> list[dict]:
             if published is None and SKIP_NO_DATE:
                 continue
 
-            summary_raw = (
-                entry.get("summary")
-                or entry.get("description")
-                or (entry.get("content") or [{}])[0].get("value", "")
-            )
+            summary_raw = (entry.get("summary") or entry.get("description")
+                           or (entry.get("content") or [{}])[0].get("value", ""))
             summary = normalize(summary_raw)
-            # بعضی فیدها عنوان را در خلاصه تکرار می‌کنند
             if summary and summary[:40] == title[:40]:
                 summary = summary[len(title):].lstrip(" .:-–—")
             if len(summary) > SUMMARY_CHARS:
@@ -246,46 +399,27 @@ def collect_items(cfg: dict) -> list[dict]:
                 dropped_region += 1
                 continue
 
-            link = clean_link(entry.get("link") or "")
-            items.append(
-                {
-                    "id": entry_id(entry),
-                    "title": title,
-                    "summary": summary,
-                    "link": link,
-                    "source": name,
-                    "published": published,
-                }
-            )
+            items.append({
+                "id": entry_id(entry),
+                "title": title,
+                "summary": summary,
+                "link": clean_link(entry.get("link") or ""),
+                "source": name,
+                "published": published,
+            })
 
     if dropped_region:
         print(f"[info] {dropped_region} خبر غیرمرتبط با خاورمیانه فیلتر شد.")
 
-    # حذف تکراری‌ها بر اساس شناسه، سپس بر اساس عنوان نزدیک به هم
-    unique, by_title = [], {}
+    unique, seen_ids = [], set()
     for item in items:
-        if not item["id"] or item["id"] in by_title:
+        if not item["id"] or item["id"] in seen_ids:
             continue
-        by_title[item["id"]] = item
+        seen_ids.add(item["id"])
         unique.append(item)
-    unique.sort(key=lambda x: x["published"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    unique.sort(key=lambda x: x["published"] or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True)
     return unique
-
-
-# ------------------------------------------------------------- تلگرام ---
-
-def tg_call(token: str, method: str, payload: dict) -> dict:
-    url = TELEGRAM_API.format(token=token, method=method)
-    try:
-        resp = requests.post(url, json=payload, timeout=30)
-        data = resp.json()
-    except (requests.RequestException, ValueError) as exc:
-        return {"ok": False, "description": str(exc)}
-    # کد وضعیت HTTP را هم در پاسخ نگه می‌داریم تا ۴۲۹ مطمئن تشخیص داده شود
-    if not isinstance(data, dict):
-        data = {"ok": False, "description": str(data)}
-    data["http_status"] = resp.status_code
-    return data
 
 
 def build_message(item: dict) -> str:
@@ -298,78 +432,61 @@ def build_message(item: dict) -> str:
     lines.append(f"🕒 {to_digits(stamp)} (به وقت ایران)")
     lines.append(f"📰 منبع: {html.escape(item['source'])}")
     if item["link"]:
-        href = item["link"]
-        lines.append(f'🔗 <a href="{html.escape(href, quote=True)}">متن کامل خبر</a>')
+        lines.append(f'🔗 <a href="{html.escape(item["link"], quote=True)}">متن کامل خبر</a>')
     return "\n".join(lines)
 
 
-def send_message(token: str, chat_id: str, text: str, dry_run: bool) -> bool:
-    if dry_run:
-        print("\n" + "=" * 60)
-        print(text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
-        return True
+# ---------------------------------------------------- مقصدها و تنظیمات ---
 
-    for attempt in range(3):
-        result = tg_call(token, "sendMessage", {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-            "allow_sending_without_reply": True,
-        })
-        if result.get("ok"):
-            return True
-
-        desc = str(result.get("description", result))
-        code = result.get("error_code") or result.get("http_status")
-        if code == 429:  # flood limit
-            wait = float(result.get("parameters", {}).get("retry_after", 5))
-            print(f"[warn] محدودیت ارسال تلگرام، {wait:.0f} ثانیه صبر…")
-            time.sleep(wait + 1)
-            continue
-        print(f"[error] ارسال ناموفق ({code}): {desc}")
-        return False
-    return False
+def load_dests() -> list:
+    return load_json(DESTS_FILE, {"dests": []}).get("dests", [])
 
 
-# ---------------------------------------------------------------- اصلی ---
+def save_dests(dests: list) -> None:
+    save_json(DESTS_FILE, {"dests": dests, "updated": int(time.time())})
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="انتشار اخبار خاورمیانه در کانال تلگرام")
-    parser.add_argument("--dry-run", action="store_true", help="فقط نمایش، بدون ارسال")
-    parser.add_argument("--limit", type=int, help="حداکثر تعداد خبر در این اجرا")
-    parser.add_argument("--force", action="store_true", help="نادیده‌گرفتن حافظهٔ «دیده شده» (برای تست)")
-    parser.add_argument("--no-save", action="store_true", help="حافظه ذخیره نشود (برای تست)")
-    args = parser.parse_args()
 
-    token = os.environ.get("BOT_TOKEN", "")
-    chat_id = os.environ.get("CHAT_ID", "")
+def load_settings() -> dict:
+    s = load_json(SETTINGS_FILE, {})
+    s.setdefault("owner_id", os.environ.get("OWNER_ID") or None)
+    s.setdefault("interval_minutes", 60)
+    s.setdefault("max_per_run", MAX_PER_RUN)
+    return s
 
-    if not args.dry_run and (not token or not chat_id):
-        print("[error] متغیرهای BOT_TOKEN و CHAT_ID تنظیم نشده‌اند.")
-        return 1
 
+def save_settings(s: dict) -> None:
+    save_json(SETTINGS_FILE, s)
+
+
+def effective_dests() -> list:
+    dests = load_dests()
+    if not dests and os.environ.get("CHAT_ID"):
+        dests = [{"id": os.environ["CHAT_ID"], "title": "(متغیر CHAT_ID)", "kind": "env"}]
+    return dests
+
+
+# ------------------------------------------------------------ انتشار خبر ---
+
+def publish_once(tg: Tg, dry_run: bool = False, limit: int | None = None,
+                 force: bool = False) -> dict:
     cfg = load_json(FEEDS_FILE, {"feeds": []})
     if not cfg.get("feeds"):
-        print("[error] feeds.json خالی یا پیدا نشد.")
-        return 1
+        return {"error": "feeds.json خالی است"}
 
-    state = load_json(STATE_FILE, {"seen": {}})
-    seen = state.get("seen", {})
+    dests = effective_dests()
+    if not dests:
+        return {"error": "هیچ مقصدی ثبت نشده (کانال/گروه اضافه کن یا CHAT_ID بگذار)"}
 
+    seen = load_json(SEEN_FILE, {"seen": {}}).get("seen", {})
     items = collect_items(cfg)
-    print(f"[info] {len(items)} خبر از فیدهای فعال خوانده شد.")
-
     cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_AGE_HOURS)
-    limit = args.limit or MAX_PER_RUN
+    limit = limit or load_settings().get("max_per_run", MAX_PER_RUN)
 
-    fresh = [
-        it for it in items
-        if it["published"] and it["published"] >= cutoff and (args.force or it["id"] not in seen)
-    ]
+    fresh = [it for it in items
+             if it["published"] and it["published"] >= cutoff
+             and (force or it["id"] not in seen)]
 
-    # اولین اجرا: فقط چند خبر منتشر کن و بقیه را «دیده‌شده» ثبت کن تا کانال سیل‌آسا نشود
-    first_run = not seen and not args.force
+    first_run = not seen and not force and not dry_run
     if first_run:
         for it in items:
             seen[it["id"]] = int(time.time())
@@ -378,31 +495,553 @@ def main() -> int:
     else:
         fresh = fresh[:limit]
 
+    stats = {"new_total": len(items), "fresh": len(fresh), "sent": 0, "errors": 0,
+             "dests": len(dests)}
     if not fresh:
         print("[info] خبر تازه‌ای نبود.")
-        return 0
+        return stats
 
-    print(f"[info] {len(fresh)} خبر تازه برای انتشار:")
-    sent = 0
     for item in fresh:
-        if send_message(token, chat_id, build_message(item), args.dry_run):
+        text = build_message(item)
+        if dry_run:
+            print("=" * 50)
+            print(re.sub(r"</?(b|i|a)[^>]*>", "", text))
             seen[item["id"]] = int(time.time())
-            sent += 1
-            print(f"  ✔ {item['source']} | {item['title'][:60]}")
-            if not args.dry_run:
-                time.sleep(DELAY_SECONDS)
-        else:
-            print(f"  ✘ {item['title'][:60]}")
+            stats["sent"] += 1
+            continue
+        ok_all = True
+        for d in dests:
+            r = tg.send(d["id"], text)
+            if r.get("ok"):
+                print(f"  ✔ {d['title'] if isinstance(d.get('title'), str) else d['id']} | {item['title'][:40]}")
+            else:
+                ok_all = False
+                stats["errors"] += 1
+                print(f"  ✘ {d['id']}: {r.get('description')}")
+            time.sleep(DELAY_SECONDS)
+        if ok_all:
+            seen[item["id"]] = int(time.time())
+            stats["sent"] += 1
 
-    # هرس حافظه: فقط SEEN_LIMIT مورد آخر نگه داشته شود
     if len(seen) > SEEN_LIMIT:
-        keep = dict(sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:SEEN_LIMIT])
-        seen = keep
-    if args.no_save:
-        print(f"[info] {sent} خبر منتشر شد (حافظه ذخیره نشد).")
+        seen = dict(sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:SEEN_LIMIT])
+    if not dry_run:
+        save_json(SEEN_FILE, {"seen": seen, "updated": int(time.time())})
+    stats["memory"] = len(seen)
+    print(f"[info] {stats['sent']} خبر به {len(dests)} مقصد منتشر شد.")
+    sync_state()
+    return stats
+
+
+# ------------------------------------------------------------ پنل کنترل ---
+
+def kb(rows):
+    return rows
+
+
+def btn(text, data=None, url=None):
+    b = {"text": text}
+    if data:
+        b["callback_data"] = data
+    if url:
+        b["url"] = url
+    return b
+
+
+def main_menu_text(tg: Tg, settings: dict) -> str:
+    dests = load_dests()
+    cfg = load_json(FEEDS_FILE, {"feeds": []})
+    on = sum(1 for f in cfg.get("feeds", []) if f.get("enabled", True))
+    total = len(cfg.get("feeds", []))
+    return (
+        "🎛 <b>پنل کنترل ربات خبری</b>\n\n"
+        f"📡 مقصدها: {to_digits(str(len(dests)))}\n"
+        f"📰 منابع فعال: {to_digits(str(on))} از {to_digits(str(total))}\n"
+        f"⏱ ارسال خودکار: هر {to_digits(str(settings.get('interval_minutes', 60)))} دقیقه\n"
+        f"🔢 حداکثر خبر در هر نوبت: {to_digits(str(settings.get('max_per_run', MAX_PER_RUN)))}\n\n"
+        "چه کاری انجام بدهم؟"
+    )
+
+
+def main_menu_kb():
+    return kb([
+        [btn("🔴 ارسال فوری", "p:now"), btn("📡 مقصدها", "d:list")],
+        [btn("📰 منابع خبری", "s:list"), btn("⚙️ تنظیمات", "c:main")],
+        [btn("❓ راهنما", "h:show")],
+    ])
+
+
+def dests_text(dests: list) -> str:
+    if not dests:
+        return "📡 هنوز هیچ مقصدی نداری.\nبا دکمهٔ ➕ اضافه، اولین کانال یا گروه را اضافه کن."
+    lines = ["📡 <b>مقصدهای فعال:</b>\n"]
+    for i, d in enumerate(dests):
+        kind = "📢" if d.get("kind") == "channel" else "👥"
+        lines.append(f"{kind} {to_digits(str(i + 1))}. {html.escape(str(d.get('title', d['id'])))}")
+    lines.append("\nبرای حذف، ❌ همان ردیف را بزن.")
+    return "\n".join(lines)
+
+
+def dests_kb(dests: list) -> list:
+    rows = []
+    for i, d in enumerate(dests):
+        rows.append([btn(f"❌ {str(d.get('title', d['id']))[:24]}", f"d:rm:{i}")])
+    rows.append([btn("➕ افزودن کانال/گروه", "d:add"), btn("🔙 بازگشت", "m:main")])
+    return kb(rows)
+
+
+def sources_text(cfg: dict) -> str:
+    lines = ["📰 <b>منابع خبری:</b>\n"]
+    for i, f in enumerate(cfg.get("feeds", [])):
+        mark = "✅" if f.get("enabled", True) else "⛔️"
+        lines.append(f"{mark} {to_digits(str(i + 1))}. {html.escape(f['name'])}")
+    lines.append("\nبرای روشن/خاموش‌کردن، روی همان بزن.")
+    return "\n".join(lines)
+
+
+def sources_kb(cfg: dict) -> list:
+    rows = []
+    for i, f in enumerate(cfg.get("feeds", [])):
+        mark = "✅" if f.get("enabled", True) else "⛔️"
+        rows.append([btn(f"{mark} {f['name'][:26]}", f"s:t:{i}")])
+    rows.append([btn("🔙 بازگشت", "m:main")])
+    return kb(rows)
+
+
+def settings_text(settings: dict, cfg: dict) -> str:
+    region = "روشن 🌍" if cfg.get("region_filter", True) else "خاموش"
+    return (
+        "⚙️ <b>تنظیمات</b>\n\n"
+        f"⏱ فاصلهٔ ارسال خودکار: هر {to_digits(str(settings['interval_minutes']))} دقیقه\n"
+        f"🔢 حداکثر خبر هر نوبت: {to_digits(str(settings['max_per_run']))}\n"
+        f"🌍 فیلتر «فقط خاورمیانه»: {region}\n"
+    )
+
+
+def settings_kb(settings: dict, cfg: dict) -> list:
+    iv = settings["interval_minutes"]
+    region_on = cfg.get("region_filter", True)
+    return kb([
+        [btn("⏱ −", "c:i:-"), btn(f"هر {to_digits(str(iv))} دقیقه", "c:i:0"), btn("⏱ +", "c:i:+")],
+        [btn("🔢 −", "c:l:-"), btn(f"حداکثر {to_digits(str(settings['max_per_run']))}", "c:l:0"), btn("🔢 +", "c:l:+")],
+        [btn("🌍 فیلتر خاورمیانه: " + ("روشن" if region_on else "خاموش"), "c:r")],
+        [btn("🔙 بازگشت", "m:main")],
+    ])
+
+
+HELP_TEXT = (
+    "❓ <b>راهنما</b>\n\n"
+    "📡 <b>افزودن مقصد:</b> ربات را در کانال/گروه موردنظر «مدیر» کن (با تیک ارسال پیام)، "
+    "بعد از دکمهٔ ➕ اضافه، یکی از این‌ها را همین‌جا بفرست:\n"
+    "• آیدی با @ مثل @mychannel\n"
+    "• یا یک پست از همان کانال/گروه را فوروارد کن\n"
+    "• یا شناسهٔ عددی مثل -1001234567890\n\n"
+    "🔴 <b>ارسال فوری:</b> همین حالا تازه‌ترین خبرها را به همهٔ مقصدها می‌فرستد.\n"
+    "⏱ <b>ارسال خودکار:</b> هر N دقیقه یک‌بار خودش خبر تازه می‌فرستد.\n"
+)
+
+
+def render(tg: Tg, chat_id, message_id, view: str, settings: dict):
+    cfg = load_json(FEEDS_FILE, {"feeds": []})
+    dests = load_dests()
+    if view == "main":
+        r = tg.edit(chat_id, message_id, main_menu_text(tg, settings), main_menu_kb())
+    elif view == "dests":
+        r = tg.edit(chat_id, message_id, dests_text(dests), dests_kb(dests))
+    elif view == "sources":
+        r = tg.edit(chat_id, message_id, sources_text(cfg), sources_kb(cfg))
+    elif view == "settings":
+        r = tg.edit(chat_id, message_id, settings_text(settings, cfg), settings_kb(settings, cfg))
+    elif view == "help":
+        r = tg.edit(chat_id, message_id, HELP_TEXT, kb([[btn("🔙 بازگشت", "m:main")]]))
     else:
-        save_json(STATE_FILE, {"seen": seen, "updated": int(time.time())})
-        print(f"[info] {sent} خبر منتشر شد. حافظه: {len(seen)} شناسه.")
+        r = {"ok": True}
+    if not r.get("ok"):
+        # اگر edit نشد (مثلاً پیام حذف شده)، پیام جدید بفرست
+        tg.send(chat_id, "بروزرسانی نشد؛ /start بزن.")
+    return r
+
+
+# ------------------------------------------------------------ افزودن مقصد ---
+
+def parse_dest_input(tg: Tg, msg: dict):
+    """از متن یا پیام فورواردشده، مقصد را استخراج و اعتبارسنجی می‌کند."""
+    chat_id = None
+    fwd = msg.get("forward_from_chat") or {}
+    if fwd.get("id"):
+        chat_id = fwd["id"]
+    elif msg.get("text"):
+        raw = msg["text"].strip()
+        if raw.startswith("@") and len(raw) > 3:
+            chat_id = raw
+        elif re.fullmatch(r"-?\d{5,}", raw):
+            chat_id = int(raw)
+    if chat_id is None:
+        return None, ("❌ نفهمیدم. یکی از این‌ها را بفرست:\n"
+                       "• @username\n• شناسهٔ عددی (-100…)\n• یا فوروارد یک پست از مقصد")
+
+    r = tg.get_chat(chat_id)
+    if not r.get("ok"):
+        return None, f"❌ پیدا نکردم: {r.get('description')} (مطمئن شو ربات عضو آنجا شده)"
+    chat = r["result"]
+    kind = chat.get("type", "")
+    if kind not in ("channel", "supergroup", "group"):
+        return None, "❌ این یک کانال/گروه نیست."
+
+    # بررسی دسترسی ربات
+    me_id = tg.me().get("id")
+    warn = ""
+    if me_id:
+        m = tg.chat_member(chat["id"], me_id)
+        st = (m.get("result") or {}).get("status", "")
+        if kind == "channel" and st != "administrator":
+            warn = "\n⚠️ من آنجا «مدیر» نیستم! تا خبرها برود، مرا با تیک ارسال پیام مدیر کن."
+        if kind in ("group", "supergroup") and st in ("left", "kicked"):
+            return None, "❌ من عضو آن گروه نیستم؛ اول مرا عضو کن."
+    return {"id": chat["id"], "title": chat.get("title", str(chat["id"])), "kind": kind}, warn
+
+
+# --------------------------------------------------------------- حلقهٔ زنده ---
+
+def serve(tg: Tg) -> int:
+    me = tg.me()
+    if not me.get("id"):
+        print("[error] توکن نامعتبر است (getMe ناموفق).")
+        return 1
+    print(f"[info] حالت زنده شروع شد: @{me.get('username')}")
+
+    settings = load_settings()
+    offset = load_json(OFFSET_FILE, {"offset": None}).get("offset")
+    waiting = {}
+    next_auto = time.time() + 60  # یک دقیقه تنفس اولیه
+
+    while True:
+        updates = tg.get_updates(offset, timeout=25)
+        for up in updates:
+            offset = up["update_id"] + 1
+            save_json(OFFSET_FILE, {"offset": offset})
+            try:
+                handle_update(tg, up, settings, waiting)
+            except Exception as exc:  # نباید حلقه بمیرد
+                print(f"[error] خطا در پردازش update: {exc}")
+
+        if time.time() >= next_auto:
+            settings = load_settings()
+            print(f"[info] ارسال خودکار (هر {settings['interval_minutes']} دقیقه)…")
+            publish_once(tg)
+            next_auto = time.time() + settings["interval_minutes"] * 60
+
+
+def is_owner(settings: dict, user_id: int) -> bool:
+    owner = settings.get("owner_id")
+    if owner in (None, "", "None"):
+        return False
+    return int(user_id) == int(owner)
+
+
+def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
+    if "callback_query" in up:
+        cb = up["callback_query"]
+        uid = cb["from"]["id"]
+        chat_id = cb["message"]["chat"]["id"]
+        msg_id = cb["message"]["message_id"]
+        data = cb.get("data", "")
+        tg.answer(cb["id"])
+
+        if not is_owner(settings, uid):
+            tg.answer(cb["id"], "🔒 فقط مدیر")
+            return
+
+        part = data.split(":")
+        if data == "m:main":
+            render(tg, chat_id, msg_id, "main", settings)
+        elif data == "d:list":
+            render(tg, chat_id, msg_id, "dests", settings)
+        elif data == "d:add":
+            waiting[uid] = "dest"
+            tg.edit(chat_id, msg_id,
+                    "📥 <b>افزودن مقصد</b>\n\n"
+                    "اول ربات را در کانال/گروه «مدیر» کن، بعد یکی را بفرست:\n"
+                    "• @username\n• شناسهٔ عددی\n• فوروارد یک پست از مقصد\n\n"
+                    "برای انصراف: /cancel",
+                    kb([[btn("🔙 بازگشت", "d:list")]]))
+        elif part[0] == "d" and part[1] == "rm":
+            dests = load_dests()
+            idx = int(part[2])
+            if 0 <= idx < len(dests):
+                removed = dests.pop(idx)
+                save_dests(dests)
+                tg.answer(cb["id"], f"حذف شد: {removed.get('title', '')}")
+            render(tg, chat_id, msg_id, "dests", settings)
+        elif data == "p:now":
+            tg.answer(cb["id"], "⏳ در حال ارسال…")
+            stats = publish_once(tg)
+            if stats.get("error"):
+                tg.send(chat_id, f"❌ {stats['error']}")
+            elif stats["fresh"] == 0:
+                tg.send(chat_id, "🤷 خبر تازه‌ای نبود.")
+            else:
+                tg.send(chat_id, f"✅ {to_digits(str(stats['sent']))} خبر به "
+                                 f"{to_digits(str(stats['dests']))} مقصد فرستاده شد"
+                                 + (f" ({to_digits(str(stats['errors']))} خطا)" if stats["errors"] else ""))
+            render(tg, chat_id, msg_id, "main", settings)
+        elif data == "s:list":
+            render(tg, chat_id, msg_id, "sources", settings)
+        elif part[0] == "s" and part[1] == "t":
+            cfg = load_json(FEEDS_FILE, {"feeds": []})
+            idx = int(part[2])
+            feeds = cfg.get("feeds", [])
+            if 0 <= idx < len(feeds):
+                feeds[idx]["enabled"] = not feeds[idx].get("enabled", True)
+                save_json(FEEDS_FILE, cfg)
+            render(tg, chat_id, msg_id, "sources", settings)
+        elif data == "c:main":
+            render(tg, chat_id, msg_id, "settings", settings)
+        elif part[0] == "c" and part[1] == "i" and part[2] in "+-":
+            cur = settings["interval_minutes"]
+            idx = INTERVAL_CHOICES.index(cur) if cur in INTERVAL_CHOICES else 2
+            idx = min(len(INTERVAL_CHOICES) - 1, max(0, idx + (1 if part[2] == "+" else -1)))
+            settings["interval_minutes"] = INTERVAL_CHOICES[idx]
+            save_settings(settings)
+            render(tg, chat_id, msg_id, "settings", settings)
+        elif part[0] == "c" and part[1] == "l" and part[2] in "+-":
+            cur = settings["max_per_run"]
+            cur = min(15, max(1, cur + (1 if part[2] == "+" else -1)))
+            settings["max_per_run"] = cur
+            save_settings(settings)
+            render(tg, chat_id, msg_id, "settings", settings)
+        elif data == "c:r":
+            cfg = load_json(FEEDS_FILE, {"feeds": []})
+            cfg["region_filter"] = not cfg.get("region_filter", True)
+            save_json(FEEDS_FILE, cfg)
+            render(tg, chat_id, msg_id, "settings", settings)
+        elif data == "h:show":
+            render(tg, chat_id, msg_id, "help", settings)
+        return
+
+    msg = up.get("message")
+    if not msg:
+        return
+    uid = msg["from"]["id"]
+    chat = msg["chat"]
+    text = (msg.get("text") or "").strip()
+
+    if chat["type"] != "private":
+        if text.startswith("/start"):
+            uname = tg.me().get("username", "")
+            tg.send(chat["id"], "🎛 کنترل من فقط در پی‌وی است:",
+                    kb([[btn("🎛 باز کردن پنل کنترل", url=f"https://t.me/{uname}")]]))
+        return
+
+    if text in ("/start", "/menu"):
+        if settings.get("owner_id") in (None, "", "None"):
+            settings["owner_id"] = uid
+            save_settings(settings)
+            tg.send(uid, "🎉 تو <b>مدیر</b> این ربات شدی.\n\n" + main_menu_text(tg, settings),
+                    main_menu_kb())
+        elif is_owner(settings, uid):
+            tg.send(uid, main_menu_text(tg, settings), main_menu_kb())
+        else:
+            tg.send(uid, "🔒 این ربات شخصی است.")
+        return
+
+    if text == "/cancel":
+        waiting.pop(uid, None)
+        tg.send(uid, "باشه، لغو شد.", kb([[btn("🎛 منوی اصلی", "m:main")]]))
+        return
+
+    if waiting.get(uid) == "dest" and is_owner(settings, uid):
+        dest, warn = parse_dest_input(tg, msg)
+        if dest is None:
+            tg.send(uid, warn or "❌")
+            return
+        dests = load_dests()
+        if any(d["id"] == dest["id"] for d in dests):
+            tg.send(uid, "ℹ️ این مقصد قبلاً اضافه شده.", dests_kb(dests))
+        else:
+            dests.append(dest)
+            save_dests(dests)
+            kind = "📢 کانال" if dest["kind"] == "channel" else "👥 گروه"
+            tg.send(uid, f"✅ اضافه شد: {kind} «{html.escape(dest['title'])}»\n"
+                         f"از این به بعد خبرها آنجا هم می‌رود.{warn or ''}",
+                    dests_kb(dests))
+        waiting.pop(uid, None)
+        return
+
+    # پیام ناشناخته در پی‌وی مدیر
+    if is_owner(settings, uid):
+        tg.send(uid, "دکمه‌ها را از منوی اصلی بزن 🙂", kb([[btn("🎛 منوی اصلی", "m:main")]]))
+    sync_state()
+
+
+
+# ------------------------------------------------------------ حالت وب ---
+
+WEBHOOK_SECRET = ""
+PUBLISH_LOCK = threading.Lock()
+
+
+def _spawn_publish(tg, chat_id=None, settings=None):
+    """انتشار در پس‌زمینه تا وب‌هوک سریع جواب بدهد."""
+    if not PUBLISH_LOCK.acquire(blocking=False):
+        if chat_id:
+            tg.send(chat_id, "⏳ یک ارسال دیگر در جریان است؛ چند لحظه بعد.")
+        return False
+
+    def work():
+        try:
+            stats = publish_once(tg)
+            if chat_id:
+                if stats.get("error"):
+                    tg.send(chat_id, f"❌ {stats['error']}")
+                elif stats["fresh"] == 0:
+                    tg.send(chat_id, "🤷 خبر تازه‌ای نبود.")
+                else:
+                    tg.send(chat_id, f"✅ {to_digits(str(stats['sent']))} خبر به "
+                                     f"{to_digits(str(stats['dests']))} مقصد فرستاده شد.")
+        finally:
+            PUBLISH_LOCK.release()
+
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
+
+def due_check(tg):
+    """با هر پینگ خارجی بررسی می‌کند وقت ارسال خودکار رسیده یا نه."""
+    settings = load_settings()
+    last = settings.get("last_auto", 0)
+    if time.time() - last >= settings["interval_minutes"] * 60:
+        settings["last_auto"] = int(time.time())
+        save_settings(settings)
+        sync_state()
+        _spawn_publish(tg)
+        return True
+    return False
+
+
+class WebHandler(BaseHTTPRequestHandler):
+    tg = None
+
+    def log_message(self, *a):
+        pass
+
+    def _out(self, code=200, body="ok"):
+        raw = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        if self.path.startswith("/tick") or self.path == "/":
+            due_check(self.tg)
+            self._out(200, "alive")
+        elif self.path.startswith("/health"):
+            self._out(200, "healthy")
+        else:
+            self._out(404, "not found")
+
+    def do_POST(self):
+        if not self.path.startswith("/webhook"):
+            self._out(404, "not found")
+            return
+        secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+            self._out(403, "forbidden")
+            return
+        n = int(self.headers.get("Content-Length", 0))
+        try:
+            up = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            self._out(400, "bad json")
+            return
+
+        def work():
+            settings = load_settings()
+            waiting = WEB_WAITING
+            try:
+                handle_update(self.tg, up, settings, waiting)
+                sync_state()
+            except Exception as exc:
+                print(f"[error] خطا در پردازش update: {exc}")
+
+        threading.Thread(target=work, daemon=True).start()
+        self._out(200, '{"ok":true}')
+
+
+WEB_WAITING = {}
+
+
+def web(tg) -> int:
+    global WEBHOOK_SECRET, STORE
+    STORE = STORE or init_store()
+    if STORE:
+        STORE.pull()
+
+    port = int(os.environ.get("PORT", "8080"))
+    url = os.environ.get("WEBHOOK_URL", "")
+    if not url:
+        ext = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+        url = ext + "/webhook" if ext else ""
+
+    if url:
+        WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "") or ("sns-" + tg.token[-10:])
+        r = tg.call("setWebhook", {"url": url, "secret_token": WEBHOOK_SECRET,
+                                   "drop_pending_updates": True})
+        print(f"[info] setWebhook -> {url} : {r.get('ok')} {r.get('description', '')}")
+    else:
+        print("[warn] WEBHOOK_URL/RENDER_EXTERNAL_URL نیست؛ وب‌هوک تنظیم نشد.")
+
+    WebHandler.tg = tg
+    srv = ThreadingHTTPServer(("0.0.0.0", port), WebHandler)
+    print(f"[info] حالت وب روی پورت {port} آماده است.")
+    srv.serve_forever()
+    return 0
+
+
+# ---------------------------------------------------------------- اصلی ---
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="ربات خبری خاورمیانه")
+    parser.add_argument("mode", nargs="?", choices=["serve", "web"],
+                        help="serve = زندهٔ پنل‌دار | web = وب‌هوک برای میزبان ابری")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--no-save", action="store_true")
+    args = parser.parse_args()
+
+    token = os.environ.get("BOT_TOKEN", "")
+    if not token:
+        if args.dry_run:
+            token = "DRY-RUN"   # در حالت نمایش، نیازی به توکن واقعی نیست
+        else:
+            print("[error] متغیر BOT_TOKEN تنظیم نشده است.")
+            return 1
+
+    global STORE
+    STORE = init_store()
+
+    tg = Tg(token)
+
+    if args.mode == "serve":
+        if STORE:
+            STORE.pull()
+        return serve(tg)
+
+    if args.mode == "web":
+        return web(tg)
+
+    if not os.environ.get("CHAT_ID") and not load_dests():
+        print("[error] مقصدی نیست: CHAT_ID بگذار یا اول در حالت serve مقصد اضافه کن.")
+        return 1
+
+    stats = publish_once(tg, dry_run=args.dry_run, limit=args.limit, force=args.force)
+    if stats.get("error"):
+        print(f"[error] {stats['error']}")
+        return 1
     return 0
 
 
