@@ -1,0 +1,7 @@
+{
+ "owner_id": null,
+ "interval_minutes": 60,
+ "max_per_run": 6,
+ "admins": [],
+ "last_auto": 1788030389
+}
