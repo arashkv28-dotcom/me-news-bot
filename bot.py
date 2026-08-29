@@ -597,6 +597,7 @@ def load_images_cfg() -> dict:
     d.setdefault("per_day", 1)
     d.setdefault("start_hour", 9)
     d.setdefault("gallery_dest", None)
+    d.setdefault("terms", DEFAULT_TERMS)
     return d
 
 
@@ -650,6 +651,17 @@ def _commons_files(cat: str) -> list:
     return out
 
 
+DEFAULT_TERMS = ["Pahlavi", "Reza Shah", "Mohammad Reza Pahlavi",
+                 "Farah Pahlavi", "Iran Pahlavi"]
+
+
+def _commons_search(term: str, limit: int = 25) -> list:
+    """جست‌وجوی متنی فایل‌های تصویری در Commons — پوشش بسیار فراتر از رده‌ها."""
+    d = _commons_get({"action": "query", "list": "search", "srsearch": term,
+                      "srnamespace": "6", "srlimit": str(limit), "format": "json"})
+    return [r.get("title", "") for r in d.get("query", {}).get("search", [])]
+
+
 def load_pool(cfg: dict) -> list:
     """فهرست فایل‌ها روزی یک‌بار ساخته و کش می‌شود تا سقف نرخ API رعایت شود."""
     jd = jdatetime.datetime.fromgregorian(datetime=datetime.now(TZ_TEHRAN))
@@ -661,22 +673,28 @@ def load_pool(cfg: dict) -> list:
     for cat in cfg["categories"]:
         pool += _commons_files(cat)
         time.sleep(1)
+    for term in cfg.get("terms", DEFAULT_TERMS):
+        pool += _commons_search(term)
+        time.sleep(1)
     pool = list(dict.fromkeys(pool))
     if pool:
         save_json(IMAGES_POOL_FILE, {"date": today, "pool": pool})
     return pool or cache.get("pool", [])
 
 
-def fetch_image_items(cfg: dict, want: int, seen: list) -> list:
+def fetch_image_items(cfg: dict, want: int, seen: list):
+    """برمی‌گرداند (items, error) — error: None | "empty" | "api" """
     pool = [t for t in load_pool(cfg)
             if re.search(r"\.(jpe?g|png)$", t, re.I) and t not in seen]
     random.shuffle(pool)
     picked = pool[: max(want * 3, 6)]
     if not picked:
-        return []
+        return [], "empty"
     pages = _commons_get({"action": "query", "prop": "imageinfo",
                           "iiprop": "url|extmetadata", "iiurlwidth": "1024",
                           "titles": "|".join(picked), "format": "json"}).get("query", {}).get("pages", {})
+    if not pages:
+        return [], "api"
     items = []
     for pg in pages.values():
         ii = (pg.get("imageinfo") or [{}])[0]
@@ -688,7 +706,9 @@ def fetch_image_items(cfg: dict, want: int, seen: list) -> list:
                       "page": ii.get("descriptionurl", ""), "license": lic})
         if len(items) >= want:
             break
-    return items
+    if not items:
+        return [], "api"
+    return items, None
 
 
 def clean_file_title(t: str) -> str:
@@ -728,7 +748,10 @@ def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
         print("[warn] تصویر روز: مقصد گالری انتخاب نشده (از پنل 🖼 یا IMAGE_CHAT_ID)")
         return {"due": 0, "error": "مقصد گالری انتخاب نشده؛ از منوی 🖼 یک کانال را 📌 بزن"}
 
-    items = fetch_image_items(cfg, due, st["seen"])
+    items, err = fetch_image_items(cfg, due, st["seen"])
+    if err == "api":
+        print("[warn] تصویر روز: ویکی‌مدیا پاسخ نداد (شلوغی/نرخ)")
+        return {"due": due, "sent": 0, "api_error": True}
     sent = 0
     for it in items:
         stamp = jalali_stamp(now)
@@ -1150,8 +1173,10 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
             r = post_images(tg, force=True)
             if r.get("error"):
                 tg.send(chat_id, f"❌ {r['error']}")
+            elif r.get("api_error"):
+                tg.send(chat_id, "⚠️ ویکی‌مدیا موقتاً جواب نداد؛ چند دقیقهٔ دیگر دوباره بزن.")
             elif r.get("sent", 0) == 0:
-                tg.send(chat_id, "🤷 عکس تازه‌ای پیدا نشد.")
+                tg.send(chat_id, "🤷 همهٔ عکس‌های موجود ارسال شده‌اند؛ فردا عکس‌های تازه می‌آید.")
             else:
                 tg.send(chat_id, f"🖼 {to_digits(str(r['sent']))} عکس به کانال گالری رفت.")
             render(tg, chat_id, msg_id, "main", settings)
@@ -1168,8 +1193,10 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
                 if r.get("sent", 0):
                     tg.send(chat_id, f"🖼 {to_digits(str(r['sent']))} عکس به «{title}» رفت.\n"
                                      "از این به بعد عکس‌ها خودکار همین‌جا می‌روند.")
+                elif r.get("api_error"):
+                    tg.send(chat_id, "⚠️ ویکی‌مدیا موقتاً جواب نداد؛ چند دقیقهٔ دیگر دوباره بزن.")
                 elif not r.get("error"):
-                    tg.send(chat_id, "🤷 عکس تازه‌ای پیدا نشد.")
+                    tg.send(chat_id, "🤷 همهٔ عکس‌های موجود ارسال شده‌اند؛ فردا عکس‌های تازه می‌آید.")
             render(tg, chat_id, msg_id, "main", settings)
         elif data == "i:main":
             render(tg, chat_id, msg_id, "images", settings)
