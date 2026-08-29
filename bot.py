@@ -663,26 +663,16 @@ def _commons_search(term: str, limit: int = 25) -> list:
 
 
 def load_pool(cfg: dict) -> list:
-    """استخر آیتم‌ها روزی یک‌بار ساخته/کش می‌شود؛ اگر API در دسترس نبود
-    (مثلاً از آی‌پی ابری)، بانک آمادهٔ images_pool_seed.json استفاده می‌شود."""
+    """در لحظهٔ ارسال هیچ تماس API گرفته نمی‌شود (آی‌پی‌های ابری بلاک می‌شوند):
+    استخر = کش امروز یا بانک آمادهٔ images_pool_seed.json."""
     jd = jdatetime.datetime.fromgregorian(datetime=datetime.now(TZ_TEHRAN))
     today = f"{jd.year}/{jd.month:02d}/{jd.day:02d}"
     cache = load_json(IMAGES_POOL_FILE, {"date": "", "pool": []})
     if (cache.get("date") == today and cache.get("pool")
             and isinstance(cache["pool"][0], dict)):
         return cache["pool"]
-    titles = []
-    for cat in cfg["categories"]:
-        titles += _commons_files(cat)
-        time.sleep(1)
-    for term in cfg.get("terms", DEFAULT_TERMS):
-        titles += _commons_search(term)
-        time.sleep(1)
-    titles = [t for t in dict.fromkeys(titles) if re.search(r"\.(jpe?g|png)$", t, re.I)]
-    items = _resolve_items(titles) if titles else []
-    if not items:
-        items = [it for it in load_json(SEED_FILE, []) if isinstance(it, dict)]
-        print(f"[info] بانک آمادهٔ عکس استفاده شد: {len(items)} آیتم")
+    items = [it for it in load_json(SEED_FILE, []) if isinstance(it, dict)]
+    print(f"[info] بانک آمادهٔ عکس: {len(items)} آیتم")
     if items:
         save_json(IMAGES_POOL_FILE, {"date": today, "pool": items})
     return items or cache.get("pool", [])
