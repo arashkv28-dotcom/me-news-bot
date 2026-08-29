@@ -663,52 +663,62 @@ def _commons_search(term: str, limit: int = 25) -> list:
 
 
 def load_pool(cfg: dict) -> list:
-    """فهرست فایل‌ها روزی یک‌بار ساخته و کش می‌شود تا سقف نرخ API رعایت شود."""
+    """استخر آیتم‌ها روزی یک‌بار ساخته/کش می‌شود؛ اگر API در دسترس نبود
+    (مثلاً از آی‌پی ابری)، بانک آمادهٔ images_pool_seed.json استفاده می‌شود."""
     jd = jdatetime.datetime.fromgregorian(datetime=datetime.now(TZ_TEHRAN))
     today = f"{jd.year}/{jd.month:02d}/{jd.day:02d}"
     cache = load_json(IMAGES_POOL_FILE, {"date": "", "pool": []})
-    if cache.get("date") == today and cache.get("pool"):
+    if (cache.get("date") == today and cache.get("pool")
+            and isinstance(cache["pool"][0], dict)):
         return cache["pool"]
-    pool = []
+    titles = []
     for cat in cfg["categories"]:
-        pool += _commons_files(cat)
+        titles += _commons_files(cat)
         time.sleep(1)
     for term in cfg.get("terms", DEFAULT_TERMS):
-        pool += _commons_search(term)
+        titles += _commons_search(term)
         time.sleep(1)
-    pool = list(dict.fromkeys(pool))
-    if pool:
-        save_json(IMAGES_POOL_FILE, {"date": today, "pool": pool})
-    return pool or cache.get("pool", [])
+    titles = [t for t in dict.fromkeys(titles) if re.search(r"\.(jpe?g|png)$", t, re.I)]
+    items = _resolve_items(titles) if titles else []
+    if not items:
+        items = [it for it in load_json(SEED_FILE, []) if isinstance(it, dict)]
+        print(f"[info] بانک آمادهٔ عکس استفاده شد: {len(items)} آیتم")
+    if items:
+        save_json(IMAGES_POOL_FILE, {"date": today, "pool": items})
+    return items or cache.get("pool", [])
+
+
+SEED_FILE = BASE / "images_pool_seed.json"
+
+
+def _resolve_items(titles: list) -> list:
+    """عنوان فایل‌ها را به آیتم‌های دارای لینک مستقیم تبدیل می‌کند."""
+    items = []
+    for i in range(0, len(titles), 40):
+        pages = _commons_get({"action": "query", "prop": "imageinfo",
+                              "iiprop": "url|extmetadata", "iiurlwidth": "1024",
+                              "titles": "|".join(titles[i:i + 40]),
+                              "format": "json"}).get("query", {}).get("pages", {})
+        for pg in pages.values():
+            ii = (pg.get("imageinfo") or [{}])[0]
+            url = ii.get("thumburl") or ii.get("url")
+            if not url:
+                continue
+            lic = ((ii.get("extmetadata") or {}).get("LicenseShortName") or {}).get("value", "مشاهدهٔ منبع")
+            items.append({"title": pg.get("title", ""), "url": url,
+                          "page": ii.get("descriptionurl", ""), "license": lic})
+        time.sleep(1)
+    return items
 
 
 def fetch_image_items(cfg: dict, want: int, seen: list):
-    """برمی‌گرداند (items, error) — error: None | "empty" | "api" """
-    pool = [t for t in load_pool(cfg)
-            if re.search(r"\.(jpe?g|png)$", t, re.I) and t not in seen]
-    random.shuffle(pool)
-    picked = pool[: max(want * 3, 6)]
-    if not picked:
+    """برمی‌گرداند (items, error) — بدون نیاز به API در لحظهٔ ارسال."""
+    pool = [it for it in load_pool(cfg)
+            if isinstance(it, dict) and it.get("title") not in seen]
+    if not pool:
         return [], "empty"
-    pages = _commons_get({"action": "query", "prop": "imageinfo",
-                          "iiprop": "url|extmetadata", "iiurlwidth": "1024",
-                          "titles": "|".join(picked), "format": "json"}).get("query", {}).get("pages", {})
-    if not pages:
-        return [], "api"
-    items = []
-    for pg in pages.values():
-        ii = (pg.get("imageinfo") or [{}])[0]
-        url = ii.get("thumburl") or ii.get("url")
-        if not url:
-            continue
-        lic = ((ii.get("extmetadata") or {}).get("LicenseShortName") or {}).get("value", "مشاهدهٔ منبع")
-        items.append({"title": pg.get("title", ""), "url": url,
-                      "page": ii.get("descriptionurl", ""), "license": lic})
-        if len(items) >= want:
-            break
-    if not items:
-        return [], "api"
-    return items, None
+    random.shuffle(pool)
+    return pool[:want], None
 
 
 def clean_file_title(t: str) -> str:
@@ -1266,9 +1276,16 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
                                  "در Environment رندر این متغیرها لازم است: " + "، ".join(missing))
             else:
                 rep = STORE.sync_report()
-                lines = ["☁️ نتیجهٔ تست حافظه:"]
+                lines = ["☁️ نتیجه تست حافظه:"]
                 for name, ok in rep.items():
                     lines.append(("✅ " if ok else "❌ ") + name + ("" if ok else f" — {STORE.last_error}"))
+                if any(not ok for ok in rep.values()):
+                    if "404" in STORE.last_error:
+                        lines.append("\n💡 404 یعنی GITHUB_TOKEN به این مخزن دسترسی ندارد "
+                                     "(یا GITHUB_REPO غلط است) — نه اینکه فایل نباشد. "
+                                     "یک توکن Classic با تیک public_repo بساز و در Render جایگزین کن.")
+                    elif "401" in STORE.last_error:
+                        lines.append("\n💡 401 یعنی خودِ توکن نامعتبر است؛ دوباره کپی‌اش کن.")
                 tg.send(chat_id, "\n".join(lines))
             render(tg, chat_id, msg_id, "settings", settings)
         elif data == "h:show":
