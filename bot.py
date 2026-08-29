@@ -474,11 +474,27 @@ def save_settings(s: dict) -> None:
     save_json(SETTINGS_FILE, s)
 
 
-def effective_dests() -> list:
+def ensure_chat_id_dest(tg: Tg) -> None:
+    """کانالِ متغیر CHAT_ID را برای همیشه به فهرست مقصدها اضافه می‌کند
+    تا با افزودن کانال‌های دیگر از پنل، هرگز از قلم نیفتد."""
+    cid = os.environ.get("CHAT_ID", "")
+    if not cid:
+        return
     dests = load_dests()
-    if not dests and os.environ.get("CHAT_ID"):
-        dests = [{"id": os.environ["CHAT_ID"], "title": "(متغیر CHAT_ID)", "kind": "env"}]
-    return dests
+    key, title = cid, "(متغیر CHAT_ID)"
+    r = tg.get_chat(cid)
+    if r.get("ok"):
+        key = r["result"]["id"]
+        title = r["result"].get("title", title)
+    if any(str(d["id"]) == str(key) for d in dests):
+        return
+    dests.insert(0, {"id": key, "title": title, "kind": "channel"})
+    save_dests(dests)
+    print(f"[info] کانال CHAT_ID به مقصدها اضافه شد: {title}")
+
+
+def effective_dests() -> list:
+    return load_dests()
 
 
 # ------------------------------------------------------------ انتشار خبر ---
@@ -533,6 +549,7 @@ def publish_once(tg: Tg, dry_run: bool = False, limit: int | None = None,
             else:
                 ok_all = False
                 stats["errors"] += 1
+                stats.setdefault("failed", []).append(str(d.get("title", d["id"])))
                 print(f"  ✘ {d['id']}: {r.get('description')}")
             time.sleep(DELAY_SECONDS)
         if ok_all:
@@ -669,9 +686,9 @@ def image_slots(cfg: dict) -> list:
     return [min(23, cfg["start_hour"] + 4 * i) for i in range(cfg["per_day"])]
 
 
-def post_images(tg: Tg, dry_run: bool = False) -> dict:
+def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
     cfg = load_images_cfg()
-    if not cfg["enabled"]:
+    if not cfg["enabled"] and not force:
         return {"due": 0}
     st = load_json(IMAGES_STATE, {"seen": [], "date": "", "posted_today": 0})
     now = datetime.now(TZ_TEHRAN)
@@ -681,14 +698,17 @@ def post_images(tg: Tg, dry_run: bool = False) -> dict:
         st["date"] = today
         st["posted_today"] = 0
 
-    due = min(cfg["per_day"], sum(1 for h in image_slots(cfg) if h <= now.hour)) - st["posted_today"]
+    if force:
+        due = 1
+    else:
+        due = min(cfg["per_day"], sum(1 for h in image_slots(cfg) if h <= now.hour)) - st["posted_today"]
     if due <= 0:
         return {"due": 0}
 
     dest = cfg.get("gallery_dest") or os.environ.get("IMAGE_CHAT_ID")
     if not dest:
         print("[warn] تصویر روز: مقصد گالری انتخاب نشده (از پنل 🖼 یا IMAGE_CHAT_ID)")
-        return {"due": 0, "error": "no gallery dest"}
+        return {"due": 0, "error": "مقصد گالری انتخاب نشده؛ از منوی 🖼 یک کانال را 📌 بزن"}
 
     items = fetch_image_items(cfg, due, st["seen"])
     sent = 0
@@ -743,8 +763,10 @@ def main_menu_text(tg: Tg, settings: dict) -> str:
     cfg = load_json(FEEDS_FILE, {"feeds": []})
     on = sum(1 for f in cfg.get("feeds", []) if f.get("enabled", True))
     total = len(cfg.get("feeds", []))
+    cloud = "✅ متصل به گیت‌هاب" if STORE else "⚠️ خاموش! تنظیمات با هر دیپلوی می‌پرد — GITHUB_TOKEN/GITHUB_REPO را در Render بگذار"
     return (
         "🎛 <b>پنل کنترل ربات خبری</b>\n\n"
+        f"☁️ حافظهٔ ابری: {cloud}\n"
         f"📡 مقصدها: {to_digits(str(len(dests)))}\n"
         f"📰 منابع فعال: {to_digits(str(on))} از {to_digits(str(total))}\n"
         f"⏱ ارسال خودکار: هر {to_digits(str(settings.get('interval_minutes', 60)))} دقیقه\n"
@@ -755,10 +777,10 @@ def main_menu_text(tg: Tg, settings: dict) -> str:
 
 def main_menu_kb():
     return kb([
-        [btn("🔴 ارسال فوری", "p:now"), btn("📡 مقصدها", "d:list")],
-        [btn("📰 منابع خبری", "s:list"), btn("🖼 تصویر روز", "i:main")],
-        [btn("⚙️ تنظیمات", "c:main"), btn("👥 کاربران", "u:list")],
-        [btn("❓ راهنما", "h:show")],
+        [btn("🔴 فوری خبر", "p:now"), btn("🖼 فوری عکس", "i:now")],
+        [btn("📡 مقصدها", "d:list"), btn("📰 منابع خبری", "s:list")],
+        [btn("🖼 تصویر روز", "i:main"), btn("⚙️ تنظیمات", "c:main")],
+        [btn("👥 کاربران", "u:list"), btn("❓ راهنما", "h:show")],
     ])
 
 
@@ -1052,9 +1074,11 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
             elif stats["fresh"] == 0:
                 tg.send(chat_id, "🤷 خبر تازه‌ای نبود.")
             else:
+                extra = ""
+                if stats.get("failed"):
+                    extra = "\n⚠️ خطا در: " + "، ".join(stats["failed"])
                 tg.send(chat_id, f"✅ {to_digits(str(stats['sent']))} خبر به "
-                                 f"{to_digits(str(stats['dests']))} مقصد فرستاده شد"
-                                 + (f" ({to_digits(str(stats['errors']))} خطا)" if stats["errors"] else ""))
+                                 f"{to_digits(str(stats['dests']))} مقصد فرستاده شد" + extra)
             render(tg, chat_id, msg_id, "main", settings)
         elif data == "s:list":
             render(tg, chat_id, msg_id, "sources", settings)
@@ -1086,6 +1110,16 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
             cfg["region_filter"] = not cfg.get("region_filter", True)
             save_json(FEEDS_FILE, cfg)
             render(tg, chat_id, msg_id, "settings", settings)
+        elif data == "i:now":
+            tg.answer(cb["id"], "⏳ در حال ارسال عکس…")
+            r = post_images(tg, force=True)
+            if r.get("error"):
+                tg.send(chat_id, f"❌ {r['error']}")
+            elif r.get("sent", 0) == 0:
+                tg.send(chat_id, "🤷 عکس تازه‌ای پیدا نشد.")
+            else:
+                tg.send(chat_id, f"🖼 {to_digits(str(r['sent']))} عکس به کانال گالری رفت.")
+            render(tg, chat_id, msg_id, "main", settings)
         elif data == "i:main":
             render(tg, chat_id, msg_id, "images", settings)
         elif data == "i:tg":
@@ -1245,8 +1279,11 @@ def _spawn_publish(tg, chat_id=None, settings=None):
                 elif stats["fresh"] == 0:
                     tg.send(chat_id, "🤷 خبر تازه‌ای نبود.")
                 else:
+                    extra = ""
+                    if stats.get("failed"):
+                        extra = "\n⚠️ خطا در: " + "، ".join(stats["failed"])
                     tg.send(chat_id, f"✅ {to_digits(str(stats['sent']))} خبر به "
-                                     f"{to_digits(str(stats['dests']))} مقصد فرستاده شد.")
+                                     f"{to_digits(str(stats['dests']))} مقصد فرستاده شد." + extra)
         finally:
             PUBLISH_LOCK.release()
 
@@ -1328,6 +1365,8 @@ def web(tg) -> int:
     STORE = STORE or init_store()
     if STORE:
         STORE.pull()
+    ensure_chat_id_dest(tg)
+    sync_state()
 
     port = int(os.environ.get("PORT", "8080"))
     url = os.environ.get("WEBHOOK_URL", "")
@@ -1373,21 +1412,25 @@ def main() -> int:
 
     global STORE
     STORE = init_store()
+    print(f"[info] همگام‌سازی حافظه با گیت‌هاب: {'فعال -> ' + STORE.repo if STORE else 'غیرفعال'}")
 
     tg = Tg(token)
 
     if args.mode == "serve":
         if STORE:
             STORE.pull()
+        ensure_chat_id_dest(tg)
         return serve(tg)
 
     if args.mode == "web":
+        ensure_chat_id_dest(tg)
         return web(tg)
 
     if not os.environ.get("CHAT_ID") and not load_dests():
         print("[error] مقصدی نیست: CHAT_ID بگذار یا اول در حالت serve مقصد اضافه کن.")
         return 1
 
+    ensure_chat_id_dest(tg)
     stats = publish_once(tg, dry_run=args.dry_run, limit=args.limit, force=args.force)
     if stats.get("error"):
         print(f"[error] {stats['error']}")
