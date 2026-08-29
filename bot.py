@@ -140,6 +140,7 @@ class GitState:
         self.base = os.environ.get("GITHUB_API", "https://api.github.com")
         self._hashes = {}
         self._lock = threading.Lock()
+        self.last_error = ""
 
     def _req(self, method, path, payload=None):
         try:
@@ -151,6 +152,7 @@ class GitState:
             except ValueError:
                 return r.status_code, {}
         except requests.RequestException as exc:
+            self.last_error = str(exc)
             print(f"[warn] GitHub: {exc}")
             return 0, {}
 
@@ -167,14 +169,15 @@ class GitState:
                 except Exception as exc:
                     print(f"[warn] pull {name}: {exc}")
 
-    def push_file(self, path):
+    def push_file(self, path, force=False):
         name = path.name
         try:
             content = path.read_text(encoding="utf-8")
         except OSError:
+            self.last_error = f"فایل محلی {name} نیست"
             return False
         h = hashlib.sha256(content.encode()).hexdigest()
-        if self._hashes.get(name) == h:
+        if not force and self._hashes.get(name) == h:
             return True
         b64 = base64.b64encode(content.encode()).decode()
         for _attempt in range(2):
@@ -183,12 +186,25 @@ class GitState:
             payload = {"message": f"state: {name} [skip ci]", "content": b64, "branch": self.branch}
             if sha:
                 payload["sha"] = sha
-            code, _ = self._req("PUT", f"/repos/{self.repo}/contents/.state/{name}", payload)
+            code, meta = self._req("PUT", f"/repos/{self.repo}/contents/.state/{name}", payload)
             if code in (200, 201):
                 self._hashes[name] = h
                 return True
-        print(f"[warn] push {name} ناموفق")
+            self.last_error = f"HTTP {code}: {meta.get('message', '')}"
+        print(f"[warn] push {name} ناموفق — {self.last_error}")
         return False
+
+    def sync_report(self) -> dict:
+        """تست واقعی اتصال: هر سه فایل حافظه را زورکی push می‌کند."""
+        out = {}
+        with self._lock:
+            for name in SYNC_FILES:
+                path = STATE_DIR / name
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("{}" if name.endswith(".json") else "", encoding="utf-8")
+                out[name] = self.push_file(path, force=True)
+        return out
 
     def sync(self):
         with self._lock:
@@ -683,7 +699,9 @@ def clean_file_title(t: str) -> str:
 
 
 def image_slots(cfg: dict) -> list:
-    return [min(23, cfg["start_hour"] + 4 * i) for i in range(cfg["per_day"])]
+    n = cfg["per_day"]
+    step = 24.0 / n
+    return sorted(int((cfg["start_hour"] + i * step) % 24) for i in range(n))
 
 
 def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
@@ -838,6 +856,7 @@ def settings_kb(settings: dict, cfg: dict) -> list:
         [btn("⏱ −", "c:i:-"), btn(f"هر {to_digits(str(iv))} دقیقه", "c:i:0"), btn("⏱ +", "c:i:+")],
         [btn("🔢 −", "c:l:-"), btn(f"حداکثر {to_digits(str(settings['max_per_run']))}", "c:l:0"), btn("🔢 +", "c:l:+")],
         [btn("🌍 فیلتر خاورمیانه: " + ("روشن" if region_on else "خاموش"), "c:r")],
+        [btn("☁️ تست حافظه", "c:cloud")],
         [btn("🔙 بازگشت", "m:main")],
     ])
 
@@ -1170,7 +1189,7 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
             render(tg, chat_id, msg_id, "images", settings)
         elif part[0] == "i" and part[1] == "p" and part[2] in "+-":
             icfg = load_images_cfg()
-            icfg["per_day"] = min(4, max(1, icfg["per_day"] + (1 if part[2] == "+" else -1)))
+            icfg["per_day"] = min(24, max(1, icfg["per_day"] + (1 if part[2] == "+" else -1)))
             save_images_cfg(icfg)
             sync_state()
             render(tg, chat_id, msg_id, "images", settings)
@@ -1213,6 +1232,18 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
                 sync_state()
                 tg.answer(cb["id"], f"حذف شد: {removed.get('name', removed['id'])}")
             render(tg, chat_id, msg_id, "users", settings)
+        elif data == "c:cloud":
+            if not STORE:
+                missing = [k for k in ("GITHUB_TOKEN", "GITHUB_REPO") if not os.environ.get(k)]
+                tg.send(chat_id, "☁️ حافظهٔ ابری خاموش است.\n"
+                                 "در Environment رندر این متغیرها لازم است: " + "، ".join(missing))
+            else:
+                rep = STORE.sync_report()
+                lines = ["☁️ نتیجهٔ تست حافظه:"]
+                for name, ok in rep.items():
+                    lines.append(("✅ " if ok else "❌ ") + name + ("" if ok else f" — {STORE.last_error}"))
+                tg.send(chat_id, "\n".join(lines))
+            render(tg, chat_id, msg_id, "settings", settings)
         elif data == "h:show":
             render(tg, chat_id, msg_id, "help", settings)
         return
