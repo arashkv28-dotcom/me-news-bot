@@ -728,7 +728,10 @@ def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
     cfg = load_images_cfg()
     if not cfg["enabled"] and not force:
         return {"due": 0}
-    st = load_json(IMAGES_STATE, {"seen": [], "date": "", "posted_today": 0})
+    st = load_json(IMAGES_STATE, {})
+    st.setdefault("seen", [])
+    st.setdefault("date", "")
+    st.setdefault("posted_today", 0)
     now = datetime.now(TZ_TEHRAN)
     jd = jdatetime.datetime.fromgregorian(datetime=now)
     today = f"{jd.year}/{jd.month:02d}/{jd.day:02d}"
