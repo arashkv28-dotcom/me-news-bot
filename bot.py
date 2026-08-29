@@ -29,6 +29,7 @@ import hashlib
 import html
 import json
 import os
+import random
 import threading
 import re
 import sys
@@ -124,7 +125,7 @@ def save_json(path: Path, data) -> None:
 
 # ------------------------------------------- همگام‌سازی حافظه با گیت‌هاب ---
 
-SYNC_FILES = ("seen.json", "channels.json", "settings.json")
+SYNC_FILES = ("seen.json", "channels.json", "settings.json", "images.json", "images_state.json")
 
 
 class GitState:
@@ -330,6 +331,20 @@ class Tg:
             payload["show_alert"] = False
         self.call("answerCallbackQuery", payload)
 
+    def send_photo(self, chat_id, url: str, caption: str) -> dict:
+        for attempt in range(2):
+            r = self.call("sendPhoto", {"chat_id": chat_id, "photo": url,
+                                        "caption": caption, "parse_mode": "HTML"})
+            if r.get("ok"):
+                return r
+            desc = str(r.get("description", ""))
+            if "429" in desc or (r.get("error_code") or 0) == 429:
+                time.sleep(float(r.get("parameters", {}).get("retry_after", 3)) + 1)
+                continue
+            # لینک عکس از دسترس تلگرام خارج بود؟ یکی دیگر لازم است
+            return r
+        return {"ok": False, "description": "retry limit"}
+
     def get_updates(self, offset: int | None, timeout: int = 25) -> list:
         payload = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
         if offset is not None:
@@ -533,6 +548,180 @@ def publish_once(tg: Tg, dry_run: bool = False, limit: int | None = None,
     return stats
 
 
+# ------------------------------------------------------------ تصویر روز ---
+
+IMAGES_FILE = STATE_DIR / "images.json"
+IMAGES_STATE = STATE_DIR / "images_state.json"
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+
+
+def load_images_cfg() -> dict:
+    d = load_json(IMAGES_FILE, {})
+    d.setdefault("enabled", True)
+    d.setdefault("categories", ["Reza_Shah", "Mohammad_Reza_Pahlavi",
+                                "Pahlavi_dynasty", "Farah_Pahlavi"])
+    d.setdefault("per_day", 1)
+    d.setdefault("start_hour", 9)
+    d.setdefault("gallery_dest", None)
+    return d
+
+
+def save_images_cfg(d: dict) -> None:
+    save_json(IMAGES_FILE, d)
+
+
+COMMONS_UA = "me-news-bot/1.0 (Telegram channel bot; personal project)"
+IMAGES_POOL_FILE = STATE_DIR / "images_pool.json"
+
+
+def _commons_get(params: dict) -> dict:
+    """درخواست به API با بررسی وضعیت و یک تلاش مجدد در صورت ۴۲۹."""
+    for attempt in range(2):
+        try:
+            r = requests.get(COMMONS_API, timeout=25,
+                             headers={"User-Agent": COMMONS_UA}, params=params)
+        except requests.RequestException:
+            return {}
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except ValueError:
+                return {}
+        if r.status_code == 429 and attempt == 0:
+            time.sleep(6)
+            continue
+        return {}
+    return {}
+
+
+def _commons_files(cat: str) -> list:
+    """فایل‌های یک رده + فایل‌های زیررده‌های یک‌سطحی آن."""
+    out = []
+    members = _commons_get({"action": "query", "list": "categorymembers",
+                            "cmtitle": "Category:" + cat, "cmtype": "file|subcat",
+                            "cmlimit": "50", "format": "json"}).get("query", {}).get("categorymembers", [])
+    subs = []
+    for m in members:
+        t = m.get("title", "")
+        if t.startswith("File:"):
+            out.append(t)
+        elif t.startswith("Category:"):
+            subs.append(t)
+    for sub in subs[:6]:
+        m2 = _commons_get({"action": "query", "list": "categorymembers",
+                           "cmtitle": sub, "cmtype": "file", "cmlimit": "30",
+                           "format": "json"}).get("query", {}).get("categorymembers", [])
+        out += [m.get("title", "") for m in m2 if m.get("title", "").startswith("File:")]
+        time.sleep(1)
+    return out
+
+
+def load_pool(cfg: dict) -> list:
+    """فهرست فایل‌ها روزی یک‌بار ساخته و کش می‌شود تا سقف نرخ API رعایت شود."""
+    jd = jdatetime.datetime.fromgregorian(datetime=datetime.now(TZ_TEHRAN))
+    today = f"{jd.year}/{jd.month:02d}/{jd.day:02d}"
+    cache = load_json(IMAGES_POOL_FILE, {"date": "", "pool": []})
+    if cache.get("date") == today and cache.get("pool"):
+        return cache["pool"]
+    pool = []
+    for cat in cfg["categories"]:
+        pool += _commons_files(cat)
+        time.sleep(1)
+    pool = list(dict.fromkeys(pool))
+    if pool:
+        save_json(IMAGES_POOL_FILE, {"date": today, "pool": pool})
+    return pool or cache.get("pool", [])
+
+
+def fetch_image_items(cfg: dict, want: int, seen: list) -> list:
+    pool = [t for t in load_pool(cfg)
+            if re.search(r"\.(jpe?g|png)$", t, re.I) and t not in seen]
+    random.shuffle(pool)
+    picked = pool[: max(want * 3, 6)]
+    if not picked:
+        return []
+    pages = _commons_get({"action": "query", "prop": "imageinfo",
+                          "iiprop": "url|extmetadata", "iiurlwidth": "1024",
+                          "titles": "|".join(picked), "format": "json"}).get("query", {}).get("pages", {})
+    items = []
+    for pg in pages.values():
+        ii = (pg.get("imageinfo") or [{}])[0]
+        url = ii.get("thumburl") or ii.get("url")
+        if not url:
+            continue
+        lic = ((ii.get("extmetadata") or {}).get("LicenseShortName") or {}).get("value", "مشاهدهٔ منبع")
+        items.append({"title": pg.get("title", ""), "url": url,
+                      "page": ii.get("descriptionurl", ""), "license": lic})
+        if len(items) >= want:
+            break
+    return items
+
+
+def clean_file_title(t: str) -> str:
+    t = t.replace("File:", "", 1)
+    t = re.sub(r"\.[A-Za-z]+$", "", t)
+    t = t.replace("_", " ").strip()
+    return t[:140]
+
+
+def image_slots(cfg: dict) -> list:
+    return [min(23, cfg["start_hour"] + 4 * i) for i in range(cfg["per_day"])]
+
+
+def post_images(tg: Tg, dry_run: bool = False) -> dict:
+    cfg = load_images_cfg()
+    if not cfg["enabled"]:
+        return {"due": 0}
+    st = load_json(IMAGES_STATE, {"seen": [], "date": "", "posted_today": 0})
+    now = datetime.now(TZ_TEHRAN)
+    jd = jdatetime.datetime.fromgregorian(datetime=now)
+    today = f"{jd.year}/{jd.month:02d}/{jd.day:02d}"
+    if st.get("date") != today:
+        st["date"] = today
+        st["posted_today"] = 0
+
+    due = min(cfg["per_day"], sum(1 for h in image_slots(cfg) if h <= now.hour)) - st["posted_today"]
+    if due <= 0:
+        return {"due": 0}
+
+    dest = cfg.get("gallery_dest") or os.environ.get("IMAGE_CHAT_ID")
+    if not dest:
+        print("[warn] تصویر روز: مقصد گالری انتخاب نشده (از پنل 🖼 یا IMAGE_CHAT_ID)")
+        return {"due": 0, "error": "no gallery dest"}
+
+    items = fetch_image_items(cfg, due, st["seen"])
+    sent = 0
+    for it in items:
+        stamp = jalali_stamp(now)
+        caption = (f"🏛 <b>{html.escape(clean_file_title(it['title']))}</b>\n\n"
+                   f"📜 از آرشیو تصاویر تاریخی ایران — دوران پهلوی\n"
+                   f"🕒 {to_digits(stamp)}\n"
+                   f'🔗 <a href="{html.escape(it["page"], quote=True)}">منبع و پروانهٔ اثر: {html.escape(it["license"])}</a>')
+        if dry_run:
+            print("=" * 40)
+            print(re.sub(r"</?(b|a)[^>]*>", "", caption))
+            print("   ", it["url"][:70])
+            sent += 1
+        else:
+            r = tg.send_photo(dest, it["url"], caption)
+            if r.get("ok"):
+                print(f"  ✔ تصویر روز -> {dest}")
+                sent += 1
+            else:
+                print(f"  ✘ تصویر روز: {r.get('description')}")
+                continue
+        st["seen"].append(it["title"])
+        st["posted_today"] += 1
+        time.sleep(DELAY_SECONDS)
+
+    st["seen"] = st["seen"][-2000:]
+    if not dry_run:
+        save_json(IMAGES_STATE, st)
+        sync_state()
+    print(f"[info] تصویر روز: {sent} عکس ارسال شد.")
+    return {"due": due, "sent": sent}
+
+
 # ------------------------------------------------------------ پنل کنترل ---
 
 def kb(rows):
@@ -566,8 +755,8 @@ def main_menu_text(tg: Tg, settings: dict) -> str:
 def main_menu_kb():
     return kb([
         [btn("🔴 ارسال فوری", "p:now"), btn("📡 مقصدها", "d:list")],
-        [btn("📰 منابع خبری", "s:list"), btn("⚙️ تنظیمات", "c:main")],
-        [btn("❓ راهنما", "h:show")],
+        [btn("📰 منابع خبری", "s:list"), btn("🖼 تصویر روز", "i:main")],
+        [btn("⚙️ تنظیمات", "c:main"), btn("❓ راهنما", "h:show")],
     ])
 
 
@@ -629,6 +818,39 @@ def settings_kb(settings: dict, cfg: dict) -> list:
     ])
 
 
+def images_text(cfg: dict, dests: list) -> str:
+    status = "روشن ✅" if cfg["enabled"] else "خاموش ⛔️"
+    slots = "، ".join(to_digits(f"{h:02d}:00") for h in image_slots(cfg))
+    gtitle = "— هنوز انتخاب نشده"
+    for d in dests:
+        if d["id"] == cfg.get("gallery_dest"):
+            gtitle = f"«{d.get('title', d['id'])}»"
+    return (
+        "🖼 <b>تصویر روز</b>\n\n"
+        f"وضعیت: {status}\n"
+        f"🔢 تعداد در روز: {to_digits(str(cfg['per_day']))}\n"
+        f"⏰ ساعت‌ها: {slots} (به وقت ایران)\n"
+        f"📡 کانال گالری: {gtitle}\n\n"
+        "موضوع فعلی: آرشیو تاریخی دوران پهلوی (Wikimedia Commons)"
+    )
+
+
+def images_kb(cfg: dict, dests: list) -> list:
+    status = "✅ روشن" if cfg["enabled"] else "⛔️ خاموش"
+    rows = [
+        [btn(status, "i:tg"), btn(f"⏰ شروع: {to_digits(str(cfg['start_hour']))}", "i:h")],
+        [btn("🔢 −", "i:p:-"), btn(f"روزی {to_digits(str(cfg['per_day']))}", "i:p:0"), btn("🔢 +", "i:p:+")],
+    ]
+    if dests:
+        for i, d in enumerate(dests):
+            mark = "📌" if d["id"] == cfg.get("gallery_dest") else "📡"
+            rows.append([btn(f"{mark} {str(d.get('title', d['id']))[:28]}", f"i:d:{i}")])
+    else:
+        rows.append([btn("➕ اول از «مقصدها» کانالی اضافه کن", "d:add")])
+    rows.append([btn("🔙 بازگشت", "m:main")])
+    return kb(rows)
+
+
 HELP_TEXT = (
     "❓ <b>راهنما</b>\n\n"
     "📡 <b>افزودن مقصد:</b> ربات را در کانال/گروه موردنظر «مدیر» کن (با تیک ارسال پیام)، "
@@ -652,6 +874,9 @@ def render(tg: Tg, chat_id, message_id, view: str, settings: dict):
         r = tg.edit(chat_id, message_id, sources_text(cfg), sources_kb(cfg))
     elif view == "settings":
         r = tg.edit(chat_id, message_id, settings_text(settings, cfg), settings_kb(settings, cfg))
+    elif view == "images":
+        icfg = load_images_cfg()
+        r = tg.edit(chat_id, message_id, images_text(icfg, dests), images_kb(icfg, dests))
     elif view == "help":
         r = tg.edit(chat_id, message_id, HELP_TEXT, kb([[btn("🔙 بازگشت", "m:main")]]))
     else:
@@ -724,6 +949,8 @@ def serve(tg: Tg) -> int:
                 handle_update(tg, up, settings, waiting)
             except Exception as exc:  # نباید حلقه بمیرد
                 print(f"[error] خطا در پردازش update: {exc}")
+
+        post_images(tg)
 
         if time.time() >= next_auto:
             settings = load_settings()
@@ -815,6 +1042,36 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
             cfg["region_filter"] = not cfg.get("region_filter", True)
             save_json(FEEDS_FILE, cfg)
             render(tg, chat_id, msg_id, "settings", settings)
+        elif data == "i:main":
+            render(tg, chat_id, msg_id, "images", settings)
+        elif data == "i:tg":
+            icfg = load_images_cfg()
+            icfg["enabled"] = not icfg["enabled"]
+            save_images_cfg(icfg)
+            sync_state()
+            render(tg, chat_id, msg_id, "images", settings)
+        elif data == "i:h":
+            icfg = load_images_cfg()
+            icfg["start_hour"] = 6 if icfg["start_hour"] >= 23 else icfg["start_hour"] + 1
+            save_images_cfg(icfg)
+            sync_state()
+            render(tg, chat_id, msg_id, "images", settings)
+        elif part[0] == "i" and part[1] == "p" and part[2] in "+-":
+            icfg = load_images_cfg()
+            icfg["per_day"] = min(4, max(1, icfg["per_day"] + (1 if part[2] == "+" else -1)))
+            save_images_cfg(icfg)
+            sync_state()
+            render(tg, chat_id, msg_id, "images", settings)
+        elif part[0] == "i" and part[1] == "d":
+            dests = load_dests()
+            idx = int(part[2])
+            if 0 <= idx < len(dests):
+                icfg = load_images_cfg()
+                icfg["gallery_dest"] = dests[idx]["id"]
+                save_images_cfg(icfg)
+                sync_state()
+                tg.answer(cb["id"], f"گالری: {dests[idx].get('title', '')}")
+            render(tg, chat_id, msg_id, "images", settings)
         elif data == "h:show":
             render(tg, chat_id, msg_id, "help", settings)
         return
@@ -915,7 +1172,9 @@ def due_check(tg):
         save_settings(settings)
         sync_state()
         _spawn_publish(tg)
+        threading.Thread(target=post_images, args=(tg,), daemon=True).start()
         return True
+    threading.Thread(target=post_images, args=(tg,), daemon=True).start()
     return False
 
 
@@ -1042,6 +1301,7 @@ def main() -> int:
     if stats.get("error"):
         print(f"[error] {stats['error']}")
         return 1
+    post_images(tg, dry_run=args.dry_run)
     return 0
 
 
