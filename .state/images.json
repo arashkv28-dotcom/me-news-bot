@@ -1,1 +1,19 @@
-{}
+{
+ "enabled": true,
+ "categories": [
+  "Reza_Shah",
+  "Mohammad_Reza_Pahlavi",
+  "Pahlavi_dynasty",
+  "Farah_Pahlavi"
+ ],
+ "per_day": 1,
+ "start_hour": 0,
+ "gallery_dest": null,
+ "terms": [
+  "Pahlavi",
+  "Reza Shah",
+  "Mohammad Reza Pahlavi",
+  "Farah Pahlavi",
+  "Iran Pahlavi"
+ ]
+}
