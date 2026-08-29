@@ -748,10 +748,11 @@ def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
         print("[warn] تصویر روز: مقصد گالری انتخاب نشده (از پنل 🖼 یا IMAGE_CHAT_ID)")
         return {"due": 0, "error": "مقصد گالری انتخاب نشده؛ از منوی 🖼 یک کانال را 📌 بزن"}
 
+    pool = load_pool(cfg)
     items, err = fetch_image_items(cfg, due, st["seen"])
     if err == "api":
         print("[warn] تصویر روز: ویکی‌مدیا پاسخ نداد (شلوغی/نرخ)")
-        return {"due": due, "sent": 0, "api_error": True}
+        return {"due": due, "sent": 0, "api_error": True, "pool": len(pool)}
     sent = 0
     for it in items:
         stamp = jalali_stamp(now)
@@ -781,7 +782,7 @@ def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
         save_json(IMAGES_STATE, st)
         sync_state()
     print(f"[info] تصویر روز: {sent} عکس ارسال شد.")
-    return {"due": due, "sent": sent}
+    return {"due": due, "sent": sent, "pool": len(pool)}
 
 
 # ------------------------------------------------------------ پنل کنترل ---
@@ -1170,13 +1171,24 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
                     render(tg, chat_id, msg_id, "ipick", settings)
                 return
             tg.answer(cb["id"], "⏳ در حال ارسال عکس…")
-            r = post_images(tg, force=True)
+            try:
+                r = post_images(tg, force=True)
+            except Exception as exc:
+                import traceback
+                try:
+                    LAST_ERROR_FILE.write_text(traceback.format_exc(), encoding="utf-8")
+                except OSError:
+                    pass
+                tg.send(chat_id, f"❌ خطای فنی: {exc}")
+                render(tg, chat_id, msg_id, "main", settings)
+                return
             if r.get("error"):
                 tg.send(chat_id, f"❌ {r['error']}")
             elif r.get("api_error"):
                 tg.send(chat_id, "⚠️ ویکی‌مدیا موقتاً جواب نداد؛ چند دقیقهٔ دیگر دوباره بزن.")
             elif r.get("sent", 0) == 0:
-                tg.send(chat_id, "🤷 همهٔ عکس‌های موجود ارسال شده‌اند؛ فردا عکس‌های تازه می‌آید.")
+                tg.send(chat_id, f"🤷 چیزی برای ارسال نیست. (اندازهٔ بانک: "
+                                 f"{to_digits(str(r.get('pool', 0)))} عکس)")
             else:
                 tg.send(chat_id, f"🖼 {to_digits(str(r['sent']))} عکس به کانال گالری رفت.")
             render(tg, chat_id, msg_id, "main", settings)
@@ -1358,6 +1370,21 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
 
 WEBHOOK_SECRET = ""
 PUBLISH_LOCK = threading.Lock()
+VERSION = "v8-diag"
+BOOT_TS = time.time()
+LAST_ERROR_FILE = STATE_DIR / "last_error.txt"
+
+
+def _safe_post_images(tg):
+    try:
+        post_images(tg)
+    except Exception:
+        import traceback
+        try:
+            LAST_ERROR_FILE.write_text(traceback.format_exc(), encoding="utf-8")
+        except OSError:
+            pass
+        print("[error] post_images crash")
 
 
 def _spawn_publish(tg, chat_id=None, settings=None):
@@ -1397,9 +1424,9 @@ def due_check(tg):
         save_settings(settings)
         sync_state()
         _spawn_publish(tg)
-        threading.Thread(target=post_images, args=(tg,), daemon=True).start()
+        threading.Thread(target=_safe_post_images, args=(tg,), daemon=True).start()
         return True
-    threading.Thread(target=post_images, args=(tg,), daemon=True).start()
+    threading.Thread(target=_safe_post_images, args=(tg,), daemon=True).start()
     return False
 
 
@@ -1423,6 +1450,27 @@ class WebHandler(BaseHTTPRequestHandler):
             self._out(200, "alive")
         elif self.path.startswith("/health"):
             self._out(200, "healthy")
+        elif self.path.startswith("/diag"):
+            info = {"version": VERSION, "uptime_s": int(time.time() - BOOT_TS),
+                    "seed_exists": SEED_FILE.exists(),
+                    "seed_n": len(load_json(SEED_FILE, [])) if SEED_FILE.exists() else 0,
+                    "pool_cache": IMAGES_POOL_FILE.exists(),
+                    "store": bool(STORE)}
+            icfg = load_images_cfg()
+            st = load_json(IMAGES_STATE, {})
+            now = datetime.now(TZ_TEHRAN)
+            info.update({"enabled": icfg["enabled"], "dest": icfg.get("gallery_dest"),
+                         "per_day": icfg["per_day"], "hour_now": now.hour,
+                         "date": st.get("date"), "posted": st.get("posted_today"),
+                         "seen": len(st.get("seen", []))})
+            ss = load_settings()
+            info["last_auto"] = ss.get("last_auto")
+            info["interval"] = ss.get("interval_minutes")
+            try:
+                info["last_error"] = LAST_ERROR_FILE.read_text(encoding="utf-8")[-400:]
+            except OSError:
+                info["last_error"] = None
+            self._out(200, json.dumps(info, ensure_ascii=False))
         else:
             self._out(404, "not found")
 
