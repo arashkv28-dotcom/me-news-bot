@@ -466,6 +466,7 @@ def load_settings() -> dict:
     s.setdefault("owner_id", os.environ.get("OWNER_ID") or None)
     s.setdefault("interval_minutes", 60)
     s.setdefault("max_per_run", MAX_PER_RUN)
+    s.setdefault("admins", [])
     return s
 
 
@@ -756,7 +757,8 @@ def main_menu_kb():
     return kb([
         [btn("🔴 ارسال فوری", "p:now"), btn("📡 مقصدها", "d:list")],
         [btn("📰 منابع خبری", "s:list"), btn("🖼 تصویر روز", "i:main")],
-        [btn("⚙️ تنظیمات", "c:main"), btn("❓ راهنما", "h:show")],
+        [btn("⚙️ تنظیمات", "c:main"), btn("👥 کاربران", "u:list")],
+        [btn("❓ راهنما", "h:show")],
     ])
 
 
@@ -818,6 +820,36 @@ def settings_kb(settings: dict, cfg: dict) -> list:
     ])
 
 
+def hour_kb(cfg: dict) -> list:
+    rows, row = [], []
+    for h in range(24):
+        mark = "📌 " if h == cfg["start_hour"] else ""
+        row.append(btn(f"{mark}{to_digits(f'{h:02d}')}", f"i:hs:{h}"))
+        if len(row) == 6:
+            rows.append(row)
+            row = []
+    rows.append([btn("🔙 بازگشت", "i:main")])
+    return kb(rows)
+
+
+def users_text(settings: dict) -> str:
+    lines = ["👥 <b>کاربران مجاز پنل</b>\n",
+             f"👑 مالک: {to_digits(str(settings['owner_id']))}"]
+    for i, a in enumerate(settings.get("admins", [])):
+        lines.append(f"{to_digits(str(i + 1))}. {html.escape(a.get('name') or '—')} "
+                     f"({to_digits(str(a['id']))})")
+    lines.append("\n➕ افزودن: یک کد ۴رقمی می‌گیری، به شخص می‌دهی و او در پی‌وی ربات کد را می‌فرستد.")
+    return "\n".join(lines)
+
+
+def users_kb(settings: dict) -> list:
+    rows = []
+    for i, a in enumerate(settings.get("admins", [])):
+        rows.append([btn(f"❌ {(a.get('name') or str(a['id']))[:24]}", f"u:rm:{i}")])
+    rows.append([btn("➕ کد دسترسی", "u:add"), btn("🔙 بازگشت", "m:main")])
+    return kb(rows)
+
+
 def images_text(cfg: dict, dests: list) -> str:
     status = "روشن ✅" if cfg["enabled"] else "خاموش ⛔️"
     slots = "، ".join(to_digits(f"{h:02d}:00") for h in image_slots(cfg))
@@ -838,7 +870,7 @@ def images_text(cfg: dict, dests: list) -> str:
 def images_kb(cfg: dict, dests: list) -> list:
     status = "✅ روشن" if cfg["enabled"] else "⛔️ خاموش"
     rows = [
-        [btn(status, "i:tg"), btn(f"⏰ شروع: {to_digits(str(cfg['start_hour']))}", "i:h")],
+        [btn(status, "i:tg"), btn(f"⏰ ساعت: {to_digits(str(cfg['start_hour']))} (انتخاب)", "i:h")],
         [btn("🔢 −", "i:p:-"), btn(f"روزی {to_digits(str(cfg['per_day']))}", "i:p:0"), btn("🔢 +", "i:p:+")],
     ]
     if dests:
@@ -859,6 +891,7 @@ HELP_TEXT = (
     "• یا یک پست از همان کانال/گروه را فوروارد کن\n"
     "• یا شناسهٔ عددی مثل -1001234567890\n\n"
     "🔴 <b>ارسال فوری:</b> همین حالا تازه‌ترین خبرها را به همهٔ مقصدها می‌فرستد.\n"
+    "👥 <b>کاربران:</b> مالک می‌تواند با کد ۴رقمی، به دیگران هم دسترسی پنل بدهد.\n"
     "⏱ <b>ارسال خودکار:</b> هر N دقیقه یک‌بار خودش خبر تازه می‌فرستد.\n"
 )
 
@@ -877,6 +910,11 @@ def render(tg: Tg, chat_id, message_id, view: str, settings: dict):
     elif view == "images":
         icfg = load_images_cfg()
         r = tg.edit(chat_id, message_id, images_text(icfg, dests), images_kb(icfg, dests))
+    elif view == "ihour":
+        icfg = load_images_cfg()
+        r = tg.edit(chat_id, message_id, "⏰ ساعت ارسال اولین عکس را انتخاب کن:", hour_kb(icfg))
+    elif view == "users":
+        r = tg.edit(chat_id, message_id, users_text(settings), users_kb(settings))
     elif view == "help":
         r = tg.edit(chat_id, message_id, HELP_TEXT, kb([[btn("🔙 بازگشت", "m:main")]]))
     else:
@@ -966,6 +1004,12 @@ def is_owner(settings: dict, user_id: int) -> bool:
     return int(user_id) == int(owner)
 
 
+def is_admin(settings: dict, user_id: int) -> bool:
+    if is_owner(settings, user_id):
+        return True
+    return any(int(a.get("id", -1)) == int(user_id) for a in settings.get("admins", []))
+
+
 def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
     if "callback_query" in up:
         cb = up["callback_query"]
@@ -975,7 +1019,7 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
         data = cb.get("data", "")
         tg.answer(cb["id"])
 
-        if not is_owner(settings, uid):
+        if not is_admin(settings, uid):
             tg.answer(cb["id"], "🔒 فقط مدیر")
             return
 
@@ -1051,8 +1095,10 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
             sync_state()
             render(tg, chat_id, msg_id, "images", settings)
         elif data == "i:h":
+            render(tg, chat_id, msg_id, "ihour", settings)
+        elif part[0] == "i" and part[1] == "hs":
             icfg = load_images_cfg()
-            icfg["start_hour"] = 6 if icfg["start_hour"] >= 23 else icfg["start_hour"] + 1
+            icfg["start_hour"] = int(part[2])
             save_images_cfg(icfg)
             sync_state()
             render(tg, chat_id, msg_id, "images", settings)
@@ -1072,6 +1118,35 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
                 sync_state()
                 tg.answer(cb["id"], f"گالری: {dests[idx].get('title', '')}")
             render(tg, chat_id, msg_id, "images", settings)
+        elif data == "u:list":
+            if not is_owner(settings, uid):
+                tg.answer(cb["id"], "🔒 فقط مالک")
+                return
+            render(tg, chat_id, msg_id, "users", settings)
+        elif data == "u:add":
+            if not is_owner(settings, uid):
+                tg.answer(cb["id"], "🔒 فقط مالک")
+                return
+            code = "%04d" % random.randint(0, 9999)
+            settings["pending_code"] = {"code": code, "ts": int(time.time())}
+            save_settings(settings)
+            sync_state()
+            tg.send(uid, f"🔑 کد دسترسی: <b>{to_digits(code)}</b>\n\n"
+                         "این کد را به شخص موردنظر بده؛ او در پی‌وی ربات همین کد را بفرستد.\n"
+                         "(۱۰ دقیقه معتبر است)")
+            render(tg, chat_id, msg_id, "users", settings)
+        elif part[0] == "u" and part[1] == "rm":
+            if not is_owner(settings, uid):
+                tg.answer(cb["id"], "🔒 فقط مالک")
+                return
+            idx = int(part[2])
+            admins = settings.get("admins", [])
+            if 0 <= idx < len(admins):
+                removed = admins.pop(idx)
+                save_settings(settings)
+                sync_state()
+                tg.answer(cb["id"], f"حذف شد: {removed.get('name', removed['id'])}")
+            render(tg, chat_id, msg_id, "users", settings)
         elif data == "h:show":
             render(tg, chat_id, msg_id, "help", settings)
         return
@@ -1099,15 +1174,29 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
         elif is_owner(settings, uid):
             tg.send(uid, main_menu_text(tg, settings), main_menu_kb())
         else:
-            tg.send(uid, "🔒 این ربات شخصی است.")
+            tg.send(uid, "🔒 این ربات شخصی است.\nاگر کد دسترسی داری، همین‌جا بفرست.")
         return
+
+    if chat["type"] == "private" and not is_admin(settings, uid):
+        pc = settings.get("pending_code") or {}
+        if re.fullmatch(r"\d{4,6}", text) and pc.get("code") == text and time.time() - pc.get("ts", 0) < 600:
+            settings.setdefault("admins", []).append(
+                {"id": uid, "name": (msg["from"].get("first_name") or ""), "added": int(time.time())})
+            settings.pop("pending_code", None)
+            save_settings(settings)
+            sync_state()
+            tg.send(uid, "🎉 دسترسی شما فعال شد.", main_menu_kb())
+            if settings.get("owner_id"):
+                tg.send(int(settings["owner_id"]),
+                        f"👥 «{html.escape(msg['from'].get('first_name') or '')}» به پنل اضافه شد.")
+            return
 
     if text == "/cancel":
         waiting.pop(uid, None)
         tg.send(uid, "باشه، لغو شد.", kb([[btn("🎛 منوی اصلی", "m:main")]]))
         return
 
-    if waiting.get(uid) == "dest" and is_owner(settings, uid):
+    if waiting.get(uid) == "dest" and is_admin(settings, uid):
         dest, warn = parse_dest_input(tg, msg)
         if dest is None:
             tg.send(uid, warn or "❌")
@@ -1126,8 +1215,10 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
         return
 
     # پیام ناشناخته در پی‌وی مدیر
-    if is_owner(settings, uid):
+    if is_admin(settings, uid):
         tg.send(uid, "دکمه‌ها را از منوی اصلی بزن 🙂", kb([[btn("🎛 منوی اصلی", "m:main")]]))
+    else:
+        tg.send(uid, "🔒 این ربات شخصی است.\nاگر کد دسترسی داری، همین‌جا بفرست.")
     sync_state()
 
 
