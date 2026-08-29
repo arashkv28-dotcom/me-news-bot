@@ -885,7 +885,8 @@ def images_text(cfg: dict, dests: list) -> str:
         f"🔢 تعداد در روز: {to_digits(str(cfg['per_day']))}\n"
         f"⏰ ساعت‌ها: {slots} (به وقت ایران)\n"
         f"📡 کانال گالری: {gtitle}\n\n"
-        "موضوع فعلی: آرشیو تاریخی دوران پهلوی (Wikimedia Commons)"
+        + ("👆 برای انتخاب کانال عکس، روی نام یکی از کانال‌های پایین بزن.\n" if gtitle.startswith("—") else "")
+        + "موضوع فعلی: آرشیو تاریخی دوران پهلوی (Wikimedia Commons)"
     )
 
 
@@ -932,6 +933,13 @@ def render(tg: Tg, chat_id, message_id, view: str, settings: dict):
     elif view == "images":
         icfg = load_images_cfg()
         r = tg.edit(chat_id, message_id, images_text(icfg, dests), images_kb(icfg, dests))
+    elif view == "ipick":
+        rows = [[btn(f"🖼 {str(d.get('title', d['id']))[:28]}", f"i:pick:{i}")]
+                for i, d in enumerate(dests)]
+        rows.append([btn("🔙 بازگشت", "m:main")])
+        r = tg.edit(chat_id, message_id,
+                    "🖼 عکس‌ها به کدام کانال فرستاده شود؟\n"
+                    "(یک‌بار انتخاب کن؛ بعداً از «تصویر روز» قابل تغییر است)", kb(rows))
     elif view == "ihour":
         icfg = load_images_cfg()
         r = tg.edit(chat_id, message_id, "⏰ ساعت ارسال اولین عکس را انتخاب کن:", hour_kb(icfg))
@@ -1111,6 +1119,14 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
             save_json(FEEDS_FILE, cfg)
             render(tg, chat_id, msg_id, "settings", settings)
         elif data == "i:now":
+            icfg = load_images_cfg()
+            if not icfg.get("gallery_dest"):
+                if not load_dests():
+                    tg.send(chat_id, "❌ اول از 📡 مقصدها یک کانال اضافه کن.")
+                else:
+                    tg.answer(cb["id"])
+                    render(tg, chat_id, msg_id, "ipick", settings)
+                return
             tg.answer(cb["id"], "⏳ در حال ارسال عکس…")
             r = post_images(tg, force=True)
             if r.get("error"):
@@ -1119,6 +1135,22 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
                 tg.send(chat_id, "🤷 عکس تازه‌ای پیدا نشد.")
             else:
                 tg.send(chat_id, f"🖼 {to_digits(str(r['sent']))} عکس به کانال گالری رفت.")
+            render(tg, chat_id, msg_id, "main", settings)
+        elif part[0] == "i" and part[1] == "pick":
+            dests = load_dests()
+            idx = int(part[2])
+            if 0 <= idx < len(dests):
+                icfg = load_images_cfg()
+                icfg["gallery_dest"] = dests[idx]["id"]
+                save_images_cfg(icfg)
+                sync_state()
+                r = post_images(tg, force=True)
+                title = html.escape(str(dests[idx].get("title", "")))
+                if r.get("sent", 0):
+                    tg.send(chat_id, f"🖼 {to_digits(str(r['sent']))} عکس به «{title}» رفت.\n"
+                                     "از این به بعد عکس‌ها خودکار همین‌جا می‌روند.")
+                elif not r.get("error"):
+                    tg.send(chat_id, "🤷 عکس تازه‌ای پیدا نشد.")
             render(tg, chat_id, msg_id, "main", settings)
         elif data == "i:main":
             render(tg, chat_id, msg_id, "images", settings)
