@@ -30,7 +30,7 @@
    "name": "صدای آمریکا",
    "url": "https://www.voanews.com/api/",
    "lang": "fa",
-   "enabled": false,
+   "enabled": true,
    "require_persian": true,
    "dests": [
     "-1002103959267"
