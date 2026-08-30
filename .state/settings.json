@@ -2,10 +2,12 @@
  "owner_id": 6990025961,
  "interval_minutes": 60,
  "max_per_run": 10,
- "admins": [],
- "last_auto": 1788075390,
- "pending_code": {
-  "code": "1855",
-  "ts": 1788084717
- }
+ "admins": [
+  {
+   "id": 6491888510,
+   "name": "Ayeh",
+   "added": 1788084875
+  }
+ ],
+ "last_auto": 1788075390
 }
