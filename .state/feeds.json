@@ -20,7 +20,10 @@
    "name": "یورونیوز فارسی",
    "url": "https://fa.euronews.com/rss?level=theme&name=news",
    "lang": "fa",
-   "enabled": true
+   "enabled": true,
+   "dests": [
+    "-1002103959267"
+   ]
   },
   {
    "name": "صدای آمریکا",
