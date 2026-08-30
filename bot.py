@@ -331,15 +331,65 @@ def fetch_tg_channel(feed: dict) -> list[dict]:
                 dt = datetime.fromisoformat(time_m.group(1)).astimezone(timezone.utc)
             except ValueError:
                 dt = None
-        title = txt.split("\n", 1)[0][:110]
-        summary = txt[len(title):].lstrip(" \n.:-–—")
-        if len(summary) > SUMMARY_CHARS:
-            summary = summary[:SUMMARY_CHARS].rsplit(" ", 1)[0] + "…"
         entries.append({
-            "id": link, "title": title, "summary": summary, "link": link,
+            "id": link, "title": txt[:3800], "summary": "", "link": link,
             "published_parsed": dt.timetuple() if dt else None,
+            "plain": True,
         })
     return entries
+
+
+def probe_tg_channel(ch: str):
+    """(عنوان کانال, تعداد پست اخیر) یا (None, 0) اگر کانال عمومی/موجود نباشد."""
+    ch = str(ch).strip().lstrip("@")
+    if not ch:
+        return None, 0
+    try:
+        raw = requests.get(f"https://t.me/s/{ch}", timeout=15,
+                           headers={"User-Agent": USER_AGENT}).text
+    except Exception:  # noqa: BLE001
+        return None, 0
+    if "tgme_widget_message" not in raw:
+        return None, 0
+    m = re.search(r"<title>(.*?)</title>", raw, re.S)
+    name = ch
+    if m:
+        name = html.unescape(m.group(1))
+        name = re.sub(r"\s*[–\-]\s*Telegram\s*$", "", name).strip() or ch
+    n = len(re.findall(r"tgme_widget_message_text", raw))
+    return name, n
+
+
+def fetch_channel_photos(ch: str) -> list[dict]:
+    """عکس‌های اخیر یک کانال تلگرام از پیش‌نمایش عمومی — برای کانال گالری."""
+    ch = str(ch).strip().lstrip("@")
+    if not ch:
+        return []
+    try:
+        raw = requests.get(f"https://t.me/s/{ch}", timeout=20,
+                           headers={"User-Agent": USER_AGENT}).text
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] کانال عکس {ch}: {exc}")
+        return []
+    items = []
+    for b in raw.split("tgme_widget_message_wrap")[1:]:
+        imgs = re.findall(r'<img[^>]+src="(https://cdn\d*\.telesco\.pe/file/[^"]+)"', b)
+        if not imgs:
+            continue
+        t = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', b, re.S)
+        cap = ""
+        if t:
+            cap = re.sub(r"<br\s*/?>", "\n", t.group(1))
+            cap = html.unescape(re.sub(r"<[^>]+>", "", cap)).strip()
+        link_m = re.search(r'href="(https://t\.me/[^"]+/\d+)"', b)
+        page = link_m.group(1) if link_m else f"https://t.me/s/{ch}"
+        pid = page.rsplit("/", 1)[-1]
+        head = (cap.split("\n", 1)[0][:140] if cap else f"عکس {pid}")
+        items.append({"title": f"{head} ({pid})", "url": imgs[0], "page": page,
+                      "license": f"کانال تلگرام @{ch}",
+                      "credit": f"📷 از کانال تلگرام @{ch}",
+                      "caption": cap[:600]})
+    return items
 
 
 def entry_id(entry) -> str:
@@ -518,6 +568,7 @@ def collect_items(cfg: dict) -> list[dict]:
                 continue
 
             items.append({
+                "plain": entry.get("plain"),
                 "dests": feed.get("dests"),
                 "id": entry_id(entry),
                 "title": title,
@@ -543,10 +594,13 @@ def collect_items(cfg: dict) -> list[dict]:
 
 def build_message(item: dict) -> str:
     stamp = jalali_stamp(item["published"]) if item["published"] else ""
-    lines = [f"🔴 <b>{html.escape(item['title'])}</b>"]
-    if item["summary"]:
-        lines.append("")
-        lines.append(html.escape(item["summary"]))
+    if item.get("plain"):
+        lines = [html.escape(item["title"])]
+    else:
+        lines = [f"🔴 <b>{html.escape(item['title'])}</b>"]
+        if item["summary"]:
+            lines.append("")
+            lines.append(html.escape(item["summary"]))
     lines.append("")
     lines.append(f"🕒 {to_digits(stamp)} (به وقت ایران)")
     lines.append(f"📰 منبع: {html.escape(item['source'])}")
@@ -793,13 +847,18 @@ def _resolve_items(titles: list) -> list:
 
 
 def fetch_image_items(cfg: dict, want: int, seen: list):
-    """برمی‌گرداند (items, error) — بدون نیاز به API در لحظهٔ ارسال."""
+    """برمی‌گرداند (items, error) — عکس تازهٔ کانال‌ها اول، بعد آرشیو."""
     pool = [it for it in load_pool(cfg)
             if isinstance(it, dict) and it.get("title") not in seen]
-    if not pool:
+    tg_items = []
+    for c in cfg.get("img_channels", []):
+        for ph in fetch_channel_photos(c.get("channel", "")):
+            if ph["title"] not in seen:
+                tg_items.append(ph)
+    if not pool and not tg_items:
         return [], "empty"
     random.shuffle(pool)
-    return pool[:want], None
+    return (tg_items + pool)[:want], None
 
 
 def clean_file_title(t: str) -> str:
@@ -850,8 +909,10 @@ def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
     sent = 0
     for it in items:
         stamp = jalali_stamp(now)
-        caption = (f"🏛 <b>{html.escape(clean_file_title(it['title']))}</b>\n\n"
-                   f"📜 از آرشیو تصاویر تاریخی ایران — دوران پهلوی\n"
+        credit = it.get("credit", "📜 از آرشیو تصاویر تاریخی ایران — دوران پهلوی")
+        head = it.get("caption") or clean_file_title(it["title"])
+        caption = (f"🏛 <b>{html.escape(head[:200])}</b>\n\n"
+                   f"{credit}\n"
                    f"🕒 {to_digits(stamp)}\n"
                    f'🔗 <a href="{html.escape(it["page"], quote=True)}">منبع و پروانهٔ اثر: {html.escape(it["license"])}</a>')
         if dry_run:
@@ -956,6 +1017,7 @@ def sources_kb(cfg: dict) -> list:
         rlabel = "🌐 همه" if not route else f"🎯 {to_digits(str(len(route)))}"
         rows.append([btn(f"{mark} {f['name'][:20]}", f"s:t:{i}"),
                      btn(rlabel, f"s:dst:{i}")])
+    rows.append([btn("➕ افزودن منبع", "s:add")])
     rows.append([btn("🔙 بازگشت", "m:main")])
     return kb(rows)
 
@@ -1070,6 +1132,9 @@ def images_kb(cfg: dict, dests: list) -> list:
             rows.append([btn(f"{mark} {str(d.get('title', d['id']))[:28]}", f"i:d:{i}")])
     else:
         rows.append([btn("➕ اول از «مقصدها» کانالی اضافه کن", "d:add")])
+    for i, c in enumerate(cfg.get("img_channels", [])):
+        rows.append([btn(f"🖼 {str(c.get('name', c.get('channel', '?')))[:24]} (حذف ❌)", f"i:acd:{i}")])
+    rows.append([btn("➕ کانال عکس (تلگرام)", "i:ac")])
     rows.append([btn("🔙 بازگشت", "m:main")])
     return kb(rows)
 
@@ -1277,6 +1342,15 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
                 save_json(FEEDS_FILE, cfg)
                 sync_state()
             render(tg, chat_id, msg_id, "sources", settings)
+        elif data == "s:add":
+            waiting[uid] = "src"
+            tg.edit(chat_id, msg_id,
+                    "➕ <b>افزودن منبع خبر</b>\n\n"
+                    "یکی را بفرست:\n"
+                    "• @username کانال عمومی تلگرام\n"
+                    "• آدرس فید RSS (با http شروع می‌شود)\n\n"
+                    "برای انصراف: /cancel",
+                    kb([[btn("🔙 بازگشت", "s:list")]]))
         elif part[0] == "s" and part[1] == "dst":
             idx = int(part[2])
             render(tg, chat_id, msg_id, f"sd:{idx}", settings)
@@ -1379,6 +1453,24 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
                     tg.send(chat_id, "🤷 همهٔ عکس‌های موجود ارسال شده‌اند؛ فردا عکس‌های تازه می‌آید.")
             render(tg, chat_id, msg_id, "main", settings)
         elif data == "i:main":
+            render(tg, chat_id, msg_id, "images", settings)
+        elif data == "i:ac":
+            waiting[uid] = "imgch"
+            tg.edit(chat_id, msg_id,
+                    "🖼 <b>افزودن کانال عکس</b>\n\n"
+                    "@username یک کانال عمومی پُر عکس را بفرست.\n"
+                    "عکس‌های تازهٔ آن کانال، سر ساعت‌ها به کانال گالری می‌رود.\n\n"
+                    "برای انصراف: /cancel",
+                    kb([[btn("🔙 بازگشت", "i:main")]]))
+        elif part[0] == "i" and part[1] == "acd":
+            cfg = load_images_cfg()
+            chs = cfg.get("img_channels", [])
+            idx = int(part[2])
+            if 0 <= idx < len(chs):
+                removed = chs.pop(idx)
+                save_json(IMAGES_FILE, cfg)
+                sync_state()
+                tg.answer(cb["id"], f"حذف شد: {removed.get('name', '')}")
             render(tg, chat_id, msg_id, "images", settings)
         elif data == "i:tg":
             icfg = load_images_cfg()
@@ -1505,6 +1597,64 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
     if text == "/cancel":
         waiting.pop(uid, None)
         tg.send(uid, "باشه، لغو شد.", kb([[btn("🎛 منوی اصلی", "m:main")]]))
+        return
+
+    if waiting.get(uid) == "src" and is_admin(settings, uid):
+        waiting.pop(uid, None)
+        raw_in = text.strip()
+        ensure_feeds()
+        cfg = load_json(FEEDS_FILE, {"feeds": []})
+        feeds = cfg.setdefault("feeds", [])
+        tm = re.search(r"t\.me/(?:s/)?([A-Za-z0-9_]{4,})", raw_in)
+        if raw_in.lower().startswith("http") and not tm:
+            if any(f.get("url") == raw_in for f in feeds):
+                tg.send(uid, "ℹ️ این فید قبلاً اضافه شده.", sources_kb(cfg))
+                return
+            dom = re.sub(r"^https?://(www\.)?", "", raw_in).split("/")[0]
+            feeds.append({"name": dom[:40], "url": raw_in, "enabled": True})
+            save_json(FEEDS_FILE, cfg)
+            sync_state()
+            tg.send(uid, f"✅ منبع RSS اضافه شد: {html.escape(dom)}\n"
+                         f"اگر فید معتبر باشد، از اجرای بعدی خبر می‌دهد.", sources_kb(cfg))
+            return
+        ch = tm.group(1) if tm else raw_in.lstrip("@").split()[0] if raw_in else ""
+        nm, n = probe_tg_channel(ch)
+        if not nm or n <= 0:
+            tg.send(uid, "❌ کانال پیدا نشد یا عمومی نیست.\n"
+                         "username را دقیق بفرست (مثلاً @iranintltv).")
+            return
+        if any(str(f.get("channel", "")).lower() == ch.lower() for f in feeds):
+            tg.send(uid, "ℹ️ این کانال قبلاً اضافه شده.", sources_kb(cfg))
+            return
+        feeds.append({"name": f"{nm[:34]} (تلگرام)", "channel": ch, "enabled": True})
+        save_json(FEEDS_FILE, cfg)
+        sync_state()
+        tg.send(uid, f"✅ منبع اضافه شد: «{html.escape(nm[:40])}»\n"
+                     f"{to_digits(str(n))} پست اخیرش خوانده شد؛ از اجرای بعدی خبر می‌دهد.",
+                sources_kb(cfg))
+        return
+
+    if waiting.get(uid) == "imgch" and is_admin(settings, uid):
+        waiting.pop(uid, None)
+        raw_in = text.strip()
+        tm = re.search(r"t\.me/(?:s/)?([A-Za-z0-9_]{4,})", raw_in)
+        ch = tm.group(1) if tm else raw_in.lstrip("@").split()[0] if raw_in else ""
+        photos = fetch_channel_photos(ch)
+        if not photos:
+            tg.send(uid, "❌ کانال پیدا نشد یا عکسی نداشت.")
+            return
+        nm, _ = probe_tg_channel(ch)
+        cfg = load_images_cfg()
+        chs = cfg.setdefault("img_channels", [])
+        if any(str(c.get("channel", "")).lower() == ch.lower() for c in chs):
+            tg.send(uid, "ℹ️ این کانال عکس قبلاً اضافه شده.", images_kb(cfg, load_dests()))
+            return
+        chs.append({"channel": ch, "name": nm or ch})
+        save_json(IMAGES_FILE, cfg)
+        sync_state()
+        tg.send(uid, f"✅ کانال عکس اضافه شد: «{html.escape(nm or ch)}»\n"
+                     f"{to_digits(str(len(photos)))} عکس اخیرش خوانده شد؛ از نوبت بعدی به گالری می‌رود.",
+                images_kb(cfg, load_dests()))
         return
 
     if waiting.get(uid) == "dest" and is_admin(settings, uid):
