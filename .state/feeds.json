@@ -5,7 +5,10 @@
    "name": "بی‌بی‌سی فارسی",
    "url": "https://feeds.bbci.co.uk/persian/rss.xml",
    "lang": "fa",
-   "enabled": true
+   "enabled": true,
+   "dests": [
+    "-1002103959267"
+   ]
   },
   {
    "name": "رادیو فردا",
