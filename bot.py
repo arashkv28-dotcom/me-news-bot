@@ -45,8 +45,8 @@ import jdatetime
 import requests
 
 BASE = Path(__file__).resolve().parent
-FEEDS_FILE = BASE / "feeds.json"
 STATE_DIR = Path(os.environ.get("STATE_DIR", BASE / ".state"))
+FEEDS_FILE = STATE_DIR / "feeds.json"
 SEEN_FILE = STATE_DIR / "seen.json"
 DESTS_FILE = STATE_DIR / "channels.json"
 SETTINGS_FILE = STATE_DIR / "settings.json"
@@ -104,6 +104,29 @@ REGION_KEYWORDS = [
 REGION_RE = re.compile("|".join(re.escape(k.strip()) for k in REGION_KEYWORDS if k.strip()))
 
 
+DEFAULT_FEEDS = {
+    "region_filter": True,
+    "feeds": [
+        {"name": "بی‌بی‌سی فارسی", "url": "https://feeds.bbci.co.uk/persian/rss.xml", "lang": "fa", "enabled": True},
+        {"name": "رادیو فردا", "url": "https://www.radiofarda.com/api/", "lang": "fa", "enabled": True},
+        {"name": "یورونیوز فارسی", "url": "https://fa.euronews.com/rss?level=theme&name=news", "lang": "fa", "enabled": True},
+        {"name": "صدای آمریکا", "url": "https://www.voanews.com/api/", "lang": "fa", "enabled": True, "require_persian": True},
+        {"name": "الجزیره (عربی)", "url": "https://www.aljazeera.net/aljazeerarss/a7c186be-1baa-4bd4-9d80-a84db769f779/73d0e1b4-532f-45ef-b135-bfdff8b8cab9", "lang": "ar", "enabled": False, "region": True},
+        {"name": "BBC Middle East", "url": "http://feeds.bbci.co.uk/news/world/middle_east/rss.xml", "lang": "en", "enabled": False, "region": True},
+        {"name": "ایران اینترنشنال", "url": "https://www.iranintl.com/fa/rss.xml", "lang": "fa", "enabled": False,
+         "note": "فید RSS نمی‌دهد (صفحهٔ HTML)؛ روشن‌کردنش پستی تولید نمی‌کند"},
+        {"name": "ایرنا", "url": "https://fa.irna.ir/rss/tp/1", "lang": "fa", "enabled": False,
+         "note": "از سرورهای ابری در دسترس نیست"},
+    ],
+}
+
+
+def ensure_feeds() -> None:
+    if not FEEDS_FILE.exists():
+        save_json(FEEDS_FILE, DEFAULT_FEEDS)
+        print("[info] feeds.json پیش‌فرض ساخته شد")
+
+
 # -------------------------------------------------------------- ابزارها ---
 
 def load_json(path: Path, default):
@@ -125,7 +148,7 @@ def save_json(path: Path, data) -> None:
 
 # ------------------------------------------- همگام‌سازی حافظه با گیت‌هاب ---
 
-SYNC_FILES = ("seen.json", "channels.json", "settings.json", "images.json", "images_state.json")
+SYNC_FILES = ("seen.json", "channels.json", "settings.json", "images.json", "images_state.json", "feeds.json")
 
 
 class GitState:
@@ -973,6 +996,8 @@ def render(tg: Tg, chat_id, message_id, view: str, settings: dict):
     elif view == "dests":
         r = tg.edit(chat_id, message_id, dests_text(dests), dests_kb(dests))
     elif view == "sources":
+        ensure_feeds()
+        cfg = load_json(FEEDS_FILE, {"feeds": []})
         r = tg.edit(chat_id, message_id, sources_text(cfg), sources_kb(cfg))
     elif view == "settings":
         r = tg.edit(chat_id, message_id, settings_text(settings, cfg), settings_kb(settings, cfg))
@@ -1137,12 +1162,14 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
         elif data == "s:list":
             render(tg, chat_id, msg_id, "sources", settings)
         elif part[0] == "s" and part[1] == "t":
+            ensure_feeds()
             cfg = load_json(FEEDS_FILE, {"feeds": []})
             idx = int(part[2])
             feeds = cfg.get("feeds", [])
             if 0 <= idx < len(feeds):
                 feeds[idx]["enabled"] = not feeds[idx].get("enabled", True)
                 save_json(FEEDS_FILE, cfg)
+                sync_state()
             render(tg, chat_id, msg_id, "sources", settings)
         elif data == "c:main":
             render(tg, chat_id, msg_id, "settings", settings)
@@ -1160,9 +1187,11 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
             save_settings(settings)
             render(tg, chat_id, msg_id, "settings", settings)
         elif data == "c:r":
+            ensure_feeds()
             cfg = load_json(FEEDS_FILE, {"feeds": []})
             cfg["region_filter"] = not cfg.get("region_filter", True)
             save_json(FEEDS_FILE, cfg)
+            sync_state()
             render(tg, chat_id, msg_id, "settings", settings)
         elif data == "i:now":
             icfg = load_images_cfg()
@@ -1560,6 +1589,7 @@ def main() -> int:
 
     global STORE
     STORE = init_store()
+    ensure_feeds()
     print(f"[info] همگام‌سازی حافظه با گیت‌هاب: {'فعال -> ' + STORE.repo if STORE else 'غیرفعال'}")
 
     tg = Tg(token)
@@ -1578,6 +1608,7 @@ def main() -> int:
         print("[error] مقصدی نیست: CHAT_ID بگذار یا اول در حالت serve مقصد اضافه کن.")
         return 1
 
+    ensure_feeds()
     ensure_chat_id_dest(tg)
     stats = publish_once(tg, dry_run=args.dry_run, limit=args.limit, force=args.force)
     if stats.get("error"):
