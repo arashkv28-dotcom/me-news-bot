@@ -15,7 +15,10 @@
    "name": "رادیو فردا",
    "url": "https://www.radiofarda.com/api/",
    "lang": "fa",
-   "enabled": true
+   "enabled": true,
+   "dests": [
+    "-1002103959267"
+   ]
   },
   {
    "name": "یورونیوز فارسی",
