@@ -15,5 +15,11 @@
   "Mohammad Reza Pahlavi",
   "Farah Pahlavi",
   "Iran Pahlavi"
+ ],
+ "img_channels": [
+  {
+   "channel": "shahanshaharyamehr",
+   "name": "شاهنشاه آریامهر"
+  }
  ]
 }
