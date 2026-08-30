@@ -63,7 +63,10 @@
   {
    "name": "ایران اینترنشنال (تلگرام)",
    "channel": "iranintltv",
-   "enabled": true
+   "enabled": true,
+   "dests": [
+    "-1002103959267"
+   ]
   },
   {
    "name": "رضاپهلوی (تلگرام)",
