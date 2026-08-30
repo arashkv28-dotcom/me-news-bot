@@ -53,6 +53,21 @@
    "lang": "fa",
    "enabled": false,
    "note": "از سرورهای ابری در دسترس نیست"
+  },
+  {
+   "name": "ایران اینترنشنال (تلگرام)",
+   "channel": "iranintltv",
+   "enabled": true
+  },
+  {
+   "name": "رضاپهلوی (تلگرام)",
+   "channel": "OfficialRezaPahlavi",
+   "enabled": true
+  },
+  {
+   "name": "ایران و جهان در لحظه (تلگرام)",
+   "channel": "iran_jahan_darlahze",
+   "enabled": true
   }
  ]
 }
