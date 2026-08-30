@@ -3,5 +3,9 @@
  "interval_minutes": 60,
  "max_per_run": 10,
  "admins": [],
- "last_auto": 1788075390
+ "last_auto": 1788075390,
+ "pending_code": {
+  "code": "1855",
+  "ts": 1788084717
+ }
 }
