@@ -108,7 +108,10 @@
   {
    "name": "اخبار جنگ الونیوز AloNews (تلگرام)",
    "channel": "alonews",
-   "enabled": true
+   "enabled": true,
+   "dests": [
+    "-1003771052434"
+   ]
   }
  ]
 }
