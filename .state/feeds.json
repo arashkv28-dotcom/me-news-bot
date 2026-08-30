@@ -84,7 +84,10 @@
   {
    "name": "📻رادیو شمرونیاش🔞 (تلگرام)",
    "channel": "realradioshemroon",
-   "enabled": true
+   "enabled": true,
+   "dests": [
+    "-1002103959267"
+   ]
   }
  ]
 }
