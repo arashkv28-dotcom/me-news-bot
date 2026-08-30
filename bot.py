@@ -113,18 +113,39 @@ DEFAULT_FEEDS = {
         {"name": "صدای آمریکا", "url": "https://www.voanews.com/api/", "lang": "fa", "enabled": True, "require_persian": True},
         {"name": "الجزیره (عربی)", "url": "https://www.aljazeera.net/aljazeerarss/a7c186be-1baa-4bd4-9d80-a84db769f779/73d0e1b4-532f-45ef-b135-bfdff8b8cab9", "lang": "ar", "enabled": False, "region": True},
         {"name": "BBC Middle East", "url": "http://feeds.bbci.co.uk/news/world/middle_east/rss.xml", "lang": "en", "enabled": False, "region": True},
-        {"name": "ایران اینترنشنال", "url": "https://www.iranintl.com/fa/rss.xml", "lang": "fa", "enabled": False,
-         "note": "فید RSS نمی‌دهد (صفحهٔ HTML)؛ روشن‌کردنش پستی تولید نمی‌کند"},
+        {"name": "ایران اینترنشنال (تلگرام)", "channel": "iranintltv", "enabled": True},
+        {"name": "رضاپهلوی (تلگرام)", "channel": "OfficialRezaPahlavi", "enabled": True},
+        {"name": "ایران و جهان در لحظه (تلگرام)", "channel": "iran_jahan_darlahze", "enabled": True},
         {"name": "ایرنا", "url": "https://fa.irna.ir/rss/tp/1", "lang": "fa", "enabled": False,
          "note": "از سرورهای ابری در دسترس نیست"},
     ],
 }
 
 
+TG_DEFAULT_CHANNELS = [
+    ("ایران اینترنشنال (تلگرام)", "iranintltv"),
+    ("رضاپهلوی (تلگرام)", "OfficialRezaPahlavi"),
+    ("ایران و جهان در لحظه (تلگرام)", "iran_jahan_darlahze"),
+]
+
+
 def ensure_feeds() -> None:
     if not FEEDS_FILE.exists():
         save_json(FEEDS_FILE, DEFAULT_FEEDS)
         print("[info] feeds.json پیش‌فرض ساخته شد")
+        return
+    # مهاجرت: افزودن کانال‌های تلگرامی پیش‌فرض که هنوز نیستند
+    cfg = load_json(FEEDS_FILE, {})
+    feeds = cfg.setdefault("feeds", [])
+    have = {str(f.get("channel", "")).lower() for f in feeds}
+    added = False
+    for nm, ch in TG_DEFAULT_CHANNELS:
+        if ch.lower() not in have:
+            feeds.append({"name": nm, "channel": ch, "enabled": True})
+            added = True
+    if added:
+        save_json(FEEDS_FILE, cfg)
+        print("[info] منابع تلگرامی جدید به feeds اضافه شد")
 
 
 # -------------------------------------------------------------- ابزارها ---
@@ -278,6 +299,49 @@ def clean_link(raw: str) -> str:
     return raw
 
 
+def fetch_tg_channel(feed: dict) -> list[dict]:
+    """خواندن پیش‌نمایش عمومی یک کانال تلگرام از t.me/s — بدون لاگین."""
+    import html as _html
+    ch = str(feed.get("channel", "")).strip().lstrip("@")
+    if not ch:
+        return []
+    try:
+        resp = requests.get(f"https://t.me/s/{ch}", timeout=20,
+                            headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+        resp.raise_for_status()
+        raw = resp.text
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] کانال تلگرامی {ch}: {exc}")
+        return []
+    entries = []
+    for b in raw.split("tgme_widget_message_wrap")[1:]:
+        m = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', b, re.S)
+        if not m:
+            continue
+        txt = re.sub(r"<br\s*/?>", "\n", m.group(1))
+        txt = _html.unescape(re.sub(r"<[^>]+>", "", txt)).strip()
+        if len(txt) < 40:  # پیام‌های سرویسی مثل «عکس کانال به‌روز شد»
+            continue
+        link_m = re.search(r'href="(https://t\.me/[^"]+/\d+)"', b)
+        time_m = re.search(r'datetime="([^"]+)"', b)
+        link = link_m.group(1) if link_m else ""
+        dt = None
+        if time_m:
+            try:
+                dt = datetime.fromisoformat(time_m.group(1)).astimezone(timezone.utc)
+            except ValueError:
+                dt = None
+        title = txt.split("\n", 1)[0][:110]
+        summary = txt[len(title):].lstrip(" \n.:-–—")
+        if len(summary) > SUMMARY_CHARS:
+            summary = summary[:SUMMARY_CHARS].rsplit(" ", 1)[0] + "…"
+        entries.append({
+            "id": link, "title": title, "summary": summary, "link": link,
+            "published_parsed": dt.timetuple() if dt else None,
+        })
+    return entries
+
+
 def entry_id(entry) -> str:
     raw = entry.get("id") or entry.get("link") or entry.get("title") or ""
     raw = str(raw).strip()
@@ -427,8 +491,8 @@ def collect_items(cfg: dict) -> list[dict]:
         if not feed.get("enabled", True):
             continue
         name = feed["name"]
-        is_region_feed = bool(feed.get("region", False))
-        entries = fetch_feed(feed)
+        is_region_feed = bool(feed.get("region", False)) or bool(feed.get("channel"))
+        entries = fetch_tg_channel(feed) if feed.get("channel") else fetch_feed(feed)
         print(f"[info] {name}: {len(entries)} خبر")
         for entry in entries:
             title = normalize(entry.get("title", ""))
@@ -454,6 +518,7 @@ def collect_items(cfg: dict) -> list[dict]:
                 continue
 
             items.append({
+                "dests": feed.get("dests"),
                 "id": entry_id(entry),
                 "title": title,
                 "summary": summary,
@@ -582,6 +647,9 @@ def publish_once(tg: Tg, dry_run: bool = False, limit: int | None = None,
             continue
         ok_all = True
         for d in dests:
+            route = [str(x) for x in (item.get("dests") or [])]
+            if route and str(d["id"]) not in route:
+                continue
             r = tg.send(d["id"], text)
             if r.get("ok"):
                 print(f"  ✔ {d['title'] if isinstance(d.get('title'), str) else d['id']} | {item['title'][:40]}")
@@ -884,8 +952,39 @@ def sources_kb(cfg: dict) -> list:
     rows = []
     for i, f in enumerate(cfg.get("feeds", [])):
         mark = "✅" if f.get("enabled", True) else "⛔️"
-        rows.append([btn(f"{mark} {f['name'][:26]}", f"s:t:{i}")])
+        route = f.get("dests")
+        rlabel = "🌐 همه" if not route else f"🎯 {to_digits(str(len(route)))}"
+        rows.append([btn(f"{mark} {f['name'][:20]}", f"s:t:{i}"),
+                     btn(rlabel, f"s:dst:{i}")])
     rows.append([btn("🔙 بازگشت", "m:main")])
+    return kb(rows)
+
+
+def sd_text(feed: dict, dests: list) -> str:
+    route = [str(x) for x in feed.get("dests", [])]
+    name = html.escape(feed.get("name", "?"))
+    lines = [f"🎯 <b>مقصدهای «{name}»</b>\n"]
+    if not dests:
+        lines.append("هنوز مقصدی نداری؛ از 📡 مقصدها اضافه کن.")
+        return "\n".join(lines)
+    if not route:
+        lines.append("🌐 الان به <b>همهٔ مقصدها</b> می‌رود.")
+    else:
+        lines.append("فقط به مقصدهای تیک‌خورده می‌رود:")
+    for d in dests:
+        mark = "✅" if str(d["id"]) in route else "⬜️"
+        lines.append(f"{mark} {html.escape(str(d.get('title', d['id'])))}")
+    lines.append("\nهر مقصد را بزنی انتخاب/حذف می‌شود؛ 🌐 یعنی همه.")
+    return "\n".join(lines)
+
+
+def sd_kb(feed: dict, idx: int, dests: list) -> list:
+    route = [str(x) for x in feed.get("dests", [])]
+    rows = [[btn("🌐 همهٔ مقصدها", f"sd:all:{idx}")]]
+    for j, d in enumerate(dests):
+        mark = "✅" if str(d["id"]) in route else "⬜️"
+        rows.append([btn(f"{mark} {str(d.get('title', d['id']))[:26]}", f"sd:t:{idx}:{j}")])
+    rows.append([btn("🔙 بازگشت", "sd:back")])
     return kb(rows)
 
 
@@ -999,6 +1098,13 @@ def render(tg: Tg, chat_id, message_id, view: str, settings: dict):
         ensure_feeds()
         cfg = load_json(FEEDS_FILE, {"feeds": []})
         r = tg.edit(chat_id, message_id, sources_text(cfg), sources_kb(cfg))
+    elif view.startswith("sd:"):
+        ensure_feeds()
+        idx = int(view.split(":", 1)[1])
+        _cfg = load_json(FEEDS_FILE, {"feeds": []})
+        _feeds = _cfg.get("feeds", [])
+        _feed = _feeds[idx] if 0 <= idx < len(_feeds) else {}
+        r = tg.edit(chat_id, message_id, sd_text(_feed, dests), sd_kb(_feed, idx, dests))
     elif view == "settings":
         r = tg.edit(chat_id, message_id, settings_text(settings, cfg), settings_kb(settings, cfg))
     elif view == "images":
@@ -1170,6 +1276,36 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
                 feeds[idx]["enabled"] = not feeds[idx].get("enabled", True)
                 save_json(FEEDS_FILE, cfg)
                 sync_state()
+            render(tg, chat_id, msg_id, "sources", settings)
+        elif part[0] == "s" and part[1] == "dst":
+            idx = int(part[2])
+            render(tg, chat_id, msg_id, f"sd:{idx}", settings)
+        elif part[0] == "sd" and part[1] == "all":
+            idx = int(part[2])
+            cfg = load_json(FEEDS_FILE, {"feeds": []})
+            feeds = cfg.get("feeds", [])
+            if 0 <= idx < len(feeds):
+                feeds[idx]["dests"] = []
+                save_json(FEEDS_FILE, cfg)
+                sync_state()
+            render(tg, chat_id, msg_id, f"sd:{idx}", settings)
+        elif part[0] == "sd" and part[1] == "t":
+            idx, j = int(part[2]), int(part[3])
+            cfg = load_json(FEEDS_FILE, {"feeds": []})
+            feeds = cfg.get("feeds", [])
+            dl = load_dests()
+            if 0 <= idx < len(feeds) and 0 <= j < len(dl):
+                cur = [str(x) for x in feeds[idx].get("dests", [])]
+                did = str(dl[j]["id"])
+                if did in cur:
+                    cur.remove(did)
+                else:
+                    cur.append(did)
+                feeds[idx]["dests"] = cur
+                save_json(FEEDS_FILE, cfg)
+                sync_state()
+            render(tg, chat_id, msg_id, f"sd:{idx}", settings)
+        elif data == "sd:back":
             render(tg, chat_id, msg_id, "sources", settings)
         elif data == "c:main":
             render(tg, chat_id, msg_id, "settings", settings)
