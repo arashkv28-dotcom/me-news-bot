@@ -103,6 +103,11 @@
    "dests": [
     "-1002103959267"
    ]
+  },
+  {
+   "name": "اخبار جنگ الونیوز AloNews (تلگرام)",
+   "channel": "alonews",
+   "enabled": true
   }
  ]
 }
