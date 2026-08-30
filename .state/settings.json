@@ -1,7 +1,7 @@
 {
  "owner_id": 6990025961,
  "interval_minutes": 15,
- "max_per_run": 10,
+ "max_per_run": 11,
  "admins": [
   {
    "id": 6491888510,
