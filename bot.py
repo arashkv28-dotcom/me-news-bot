@@ -373,8 +373,10 @@ def fetch_channel_photos(ch: str) -> list[dict]:
         return []
     items = []
     for b in raw.split("tgme_widget_message_wrap")[1:]:
-        imgs = re.findall(r'<img[^>]+src="(https://cdn\d*\.telesco\.pe/file/[^"]+)"', b)
-        if not imgs:
+        m_img = re.search(r"background-image:url\('(https://cdn\d*\.telesco\.pe/file/[^']+)'\)", b)
+        if not m_img:
+            m_img = re.search(r'<img[^>]+src="(https://cdn\d*\.telesco\.pe/file/[^"]+)"', b)
+        if not m_img:
             continue
         t = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', b, re.S)
         cap = ""
@@ -385,11 +387,17 @@ def fetch_channel_photos(ch: str) -> list[dict]:
         page = link_m.group(1) if link_m else f"https://t.me/s/{ch}"
         pid = page.rsplit("/", 1)[-1]
         head = (cap.split("\n", 1)[0][:140] if cap else f"عکس {pid}")
-        items.append({"title": f"{head} ({pid})", "url": imgs[0], "page": page,
+        items.append({"title": f"{head} ({pid})", "url": m_img.group(1), "page": page,
                       "license": f"کانال تلگرام @{ch}",
                       "credit": f"📷 از کانال تلگرام @{ch}",
                       "caption": cap[:600]})
-    return items
+    # حذف تکراری‌ها (یک عکس ممکن است در چند بلوک تکرار شود)
+    uniq, seen_urls = [], set()
+    for it in items:
+        if it["url"] not in seen_urls:
+            seen_urls.add(it["url"])
+            uniq.append(it)
+    return uniq
 
 
 def entry_id(entry) -> str:
@@ -483,6 +491,19 @@ class Tg:
             payload["text"] = text
             payload["show_alert"] = False
         self.call("answerCallbackQuery", payload)
+
+    def send_photo_file(self, chat_id, data: bytes, caption: str) -> dict:
+        url = TELEGRAM_API.format(token=self.token, method="sendPhoto")
+        try:
+            resp = requests.post(
+                url,
+                data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                files={"photo": ("photo.jpg", data, "image/jpeg")},
+                timeout=90)
+            out = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            return {"ok": False, "description": str(exc)}
+        return out if isinstance(out, dict) else {"ok": False, "description": "پاسخ نامعتبر"}
 
     def send_photo(self, chat_id, url: str, caption: str) -> dict:
         for attempt in range(2):
@@ -861,6 +882,18 @@ def fetch_image_items(cfg: dict, want: int, seen: list):
     return (tg_items + pool)[:want], None
 
 
+def _send_photo_smart(tg, dest, url: str, caption: str) -> dict:
+    """عکس‌های پیش‌نمایش تلگرام را دانلود و به‌صورت فایل آپلود می‌کند؛ بقیه با آدرس."""
+    if "telesco.pe" in url or "cdn.telegram.org" in url:
+        try:
+            resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                return tg.send_photo_file(dest, resp.content, caption)
+        except requests.RequestException as exc:
+            print(f"[warn] دانلود عکس ناموفق: {exc}")
+    return tg.send_photo(dest, url, caption)
+
+
 def clean_file_title(t: str) -> str:
     t = t.replace("File:", "", 1)
     t = re.sub(r"\.[A-Za-z]+$", "", t)
@@ -907,6 +940,7 @@ def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
         print("[warn] تصویر روز: ویکی‌مدیا پاسخ نداد (شلوغی/نرخ)")
         return {"due": due, "sent": 0, "api_error": True, "pool": len(pool)}
     sent = 0
+    fail_desc = ""
     for it in items:
         stamp = jalali_stamp(now)
         credit = it.get("credit", "📜 از آرشیو تصاویر تاریخی ایران — دوران پهلوی")
@@ -921,12 +955,13 @@ def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
             print("   ", it["url"][:70])
             sent += 1
         else:
-            r = tg.send_photo(dest, it["url"], caption)
+            r = _send_photo_smart(tg, dest, it["url"], caption)
             if r.get("ok"):
                 print(f"  ✔ تصویر روز -> {dest}")
                 sent += 1
             else:
-                print(f"  ✘ تصویر روز: {r.get('description')}")
+                fail_desc = str(r.get("description", ""))
+                print(f"  ✘ تصویر روز: {fail_desc}")
                 continue
         st["seen"].append(it["title"])
         st["posted_today"] += 1
@@ -937,7 +972,7 @@ def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
         save_json(IMAGES_STATE, st)
         sync_state()
     print(f"[info] تصویر روز: {sent} عکس ارسال شد.")
-    return {"due": due, "sent": sent, "pool": len(pool)}
+    return {"due": due, "sent": sent, "pool": len(pool), "fail": fail_desc}
 
 
 # ------------------------------------------------------------ پنل کنترل ---
@@ -1429,8 +1464,10 @@ def handle_update(tg: Tg, up: dict, settings: dict, waiting: dict):
             elif r.get("api_error"):
                 tg.send(chat_id, "⚠️ ویکی‌مدیا موقتاً جواب نداد؛ چند دقیقهٔ دیگر دوباره بزن.")
             elif r.get("sent", 0) == 0:
+                extra = (f"\n⚠️ خطای ارسال: {html.escape(r['fail'][:120])}"
+                         if r.get("fail") else "")
                 tg.send(chat_id, f"🤷 چیزی برای ارسال نیست. (اندازهٔ بانک: "
-                                 f"{to_digits(str(r.get('pool', 0)))} عکس)")
+                                 f"{to_digits(str(r.get('pool', 0)))} عکس){extra}")
             else:
                 tg.send(chat_id, f"🖼 {to_digits(str(r['sent']))} عکس به کانال گالری رفت.")
             render(tg, chat_id, msg_id, "main", settings)
