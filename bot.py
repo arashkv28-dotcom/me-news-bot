@@ -926,6 +926,7 @@ def post_images(tg: Tg, dry_run: bool = False, force: bool = False) -> dict:
         due = 1
     else:
         due = min(cfg["per_day"], sum(1 for h in image_slots(cfg) if h <= now.hour)) - st["posted_today"]
+        due = min(due, 4)  # حداکثر ۴ عکس در هر اجرا؛ باقی در نوبت بعد
     if due <= 0:
         return {"due": 0}
 
