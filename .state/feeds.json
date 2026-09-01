@@ -112,7 +112,7 @@
   {
    "name": "پسر عاقل نوح (تلگرام)",
    "channel": "ebnenoah",
-   "enabled": true,
+   "enabled": false,
    "dests": [
     "-1002103959267",
     "-1003771052434",
