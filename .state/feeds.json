@@ -130,7 +130,7 @@
   {
    "name": "پهلوی نیوز | Pahlavi News (تلگرام)",
    "channel": "Pahlavii_News",
-   "enabled": false,
+   "enabled": true,
    "dests": [
     "-1002103959267",
     "-1002080075722",
