@@ -61,7 +61,10 @@
    "url": "https://www.iranintl.com/fa/rss.xml",
    "lang": "fa",
    "enabled": false,
-   "note": "فید RSS نمی‌دهد (صفحهٔ HTML)؛ روشن‌کردنش پستی تولید نمی‌کند"
+   "note": "فید RSS نمی‌دهد (صفحهٔ HTML)؛ روشن‌کردنش پستی تولید نمی‌کند",
+   "dests": [
+    "-1002103959267"
+   ]
   },
   {
    "name": "ایرنا",
